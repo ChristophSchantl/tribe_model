@@ -179,8 +179,6 @@ def train_and_signal(
     return df_bt, trades, compute_performance(df_bt, trades, INIT_CAP)
 
 # ─────────────────────────────────────────────────────────────
-# Ausführung für alle Ticker
-# ─────────────────────────────────────────────────────────────
 st.title("📈 Signal-basierte Trading-Strategie Backtest")
 
 results = []
@@ -198,7 +196,6 @@ for ticker in TICKERS:
             all_trades[ticker] = trades
             all_dfs[ticker] = df_bt
 
-            # Einzelkennzahlen als kleine Metrics
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Netto Rendite (%)", f"{metrics['Strategy Net (%)']:.2f}")
             col2.metric("Sharpe", f"{metrics['Sharpe-Ratio']:.2f}")
@@ -209,7 +206,7 @@ for ticker in TICKERS:
             price_fig = go.Figure()
             signal_probs = df_bt["SignalProb"]
             norm = (signal_probs - signal_probs.min()) / (signal_probs.max() - signal_probs.min() + 1e-9)
-            colors = px.colors.sequential.RdYlGn
+            colors = px.colors.diverging.RdYlGn  # <--- korrigiert
             for i in range(len(df_bt) - 1):
                 seg_x = df_bt.index[i : i + 2]
                 seg_y = df_bt["Close"].iloc[i : i + 2]
@@ -316,7 +313,6 @@ for ticker in TICKERS:
             )
             st.plotly_chart(equity_fig, use_container_width=True)
 
-            # Trades Tabelle
             with st.expander(f"Trades für {ticker}", expanded=False):
                 if not trades_df.empty:
                     df_tr = trades_df.copy()
