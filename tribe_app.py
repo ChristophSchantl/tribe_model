@@ -302,7 +302,7 @@ for ticker in TICKERS:
                     y=bh_curve,
                     name="Buy & Hold",
                     mode="lines",
-                    line=dict(dash="dash"),
+                    line=dict(dash="dash", color="black"),  # oder "royalblue", "green", etc.
                     hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
                 )
             )
