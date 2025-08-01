@@ -370,15 +370,15 @@ if results:
     total_net_return_pct = total_net_pnl / total_capital * 100
     total_gross_return_pct = total_gross_pnl / total_capital * 100
 
-    st.subheader("📊 Zusammenfassung aller Ticker")
+    st.subheader("📊 Summary of all Tickers")
     cols = st.columns(4)
-    cols[0].metric("Kumuliertes Netto P&L (€)", f"{total_net_pnl:,.2f}")
-    cols[1].metric("Kumulierte Handelskosten (€)", f"{total_fees:,.2f}")
-    cols[2].metric("Kumuliertes Brutto P&L (€)", f"{total_gross_pnl:,.2f}")
-    cols[3].metric("Gesamt Trades", f"{int(total_trades)}")
+    cols[0].metric("Cumulative Net P&LL (€)", f"{total_net_pnl:,.2f}")
+    cols[1].metric("Cumulative Trading Costs (€)", f"{total_fees:,.2f}")
+    cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
+    cols[3].metric("Total Number of Trades", f"{int(total_trades)}")
     st.markdown(
-        f"**Gesamt Netto-Rendite (%):** {total_net_return_pct:.2f}  \n"
-        f"**Gesamt Brutto-Rendite (%):** {total_gross_return_pct:.2f}"
+        f"**Total Net Return (%):** {total_net_return_pct:.2f}  \n"
+        f"**Total Gross Return (%):** {total_gross_return_pct:.2f}"
     )
 
     def color_phase_html(val):
@@ -408,7 +408,7 @@ if results:
             subset=pd.IndexSlice[:, ["Sharpe-Ratio"]],
         )
         .applymap(color_phase_html, subset=["Phase"])
-        .set_caption("Strategie-Performance pro Ticker")
+        .set_caption("Strategy-Performance per Ticker")
     )
     show_styled_or_plain(summary_df, styled)
     st.download_button(
@@ -430,7 +430,7 @@ if results:
                 "Entry Price": round(last_entry["Price"], 2),
                 "Current Prob.": round(prob, 4),
             })
-    st.subheader("📋 Offene Positionen")
+    st.subheader("📋 Open Positions")
     if open_positions:
         open_df = pd.DataFrame(open_positions)
         styled_open = open_df.style.format({
