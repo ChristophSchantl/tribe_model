@@ -214,9 +214,22 @@ for ticker in TICKERS:
             col3.metric("Sharpe", f"{metrics['Sharpe-Ratio']:.2f}")
             col4.metric("Max Drawdown (%)", f"{metrics['Max Drawdown (%)']:.2f}")
 
-
             # Preis + Signal
             price_fig = go.Figure()
+
+            # Close-Linie im Hintergrund, dünn und halbtransparent
+            price_fig.add_trace(
+                go.Scatter(
+                    x=df_bt.index,
+                    y=df_bt["Close"],
+                    mode="lines",
+                    name="Close",
+                    line=dict(color="rgba(0,0,0,0.4)", width=1),
+                    hovertemplate="Datum: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>"
+                )
+            )
+
+            # Signal-farbige Segmente darüber
             signal_probs = df_bt["SignalProb"]
             norm = (signal_probs - signal_probs.min()) / (signal_probs.max() - signal_probs.min() + 1e-9)
             colorscale = px.colors.diverging.RdYlGn
@@ -231,20 +244,10 @@ for ticker in TICKERS:
                         y=seg_y,
                         mode="lines",
                         showlegend=False,
-                        line=dict(color=color_seg, width=3),
+                        line=dict(color=color_seg, width=4),
                         hoverinfo="skip"
                     )
                 )
-            price_fig.add_trace(
-                go.Scatter(
-                    x=df_bt.index,
-                    y=df_bt["Close"],
-                    mode="lines",
-                    name="Close",
-                    line=dict(color="black"),
-                    hovertemplate="Datum: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>"
-                )
-            )
 
             trades_df = pd.DataFrame(trades)
             if not trades_df.empty:
@@ -302,7 +305,7 @@ for ticker in TICKERS:
                     y=bh_curve,
                     name="Buy & Hold",
                     mode="lines",
-                    line=dict(dash="dash", color="black"),  # oder "royalblue", "green", etc.
+                    line=dict(dash="dash", color="black"),
                     hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
                 )
             )
@@ -342,6 +345,7 @@ for ticker in TICKERS:
                     st.info("Keine Trades vorhanden.")
         except Exception as e:
             st.error(f"Fehler bei {ticker}: {e}")
+
 
 # ─────────────────────────────────────────────────────────────
 # Zusammenfassung
