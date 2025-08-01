@@ -208,11 +208,11 @@ for ticker in TICKERS:
             all_dfs[ticker] = df_bt
 
             # Kennzahlen
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3 = st.columns(3)
             col1.metric("Netto Rendite (%)", f"{metrics['Strategy Net (%)']:.2f}")
             col2.metric("Sharpe", f"{metrics['Sharpe-Ratio']:.2f}")
             col3.metric("Max Drawdown (%)", f"{metrics['Max Drawdown (%)']:.2f}")
-            col4.metric("Fees (€)", f"{metrics['Fees (€)']:.2f}")
+
 
             # Preis + Signal
             price_fig = go.Figure()
@@ -283,22 +283,13 @@ for ticker in TICKERS:
             )
             st.plotly_chart(price_fig, use_container_width=True)
 
-            # Equity-Kurve
+            # Equity-Kurve (Net Equity + Buy & Hold, ohne Gross Equity)
             equity_fig = go.Figure()
             equity_fig.add_trace(
                 go.Scatter(
                     x=df_bt.index,
                     y=df_bt["Equity_Net"],
                     name="Strategy Net Equity",
-                    mode="lines",
-                    hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
-                )
-            )
-            equity_fig.add_trace(
-                go.Scatter(
-                    x=df_bt.index,
-                    y=df_bt["Equity_Gross"],
-                    name="Strategy Gross Equity",
                     mode="lines",
                     hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
                 )
@@ -315,7 +306,7 @@ for ticker in TICKERS:
                 )
             )
             equity_fig.update_layout(
-                title=f"{ticker}: Equity-Kurve vs. Buy & Hold",
+                title=f"{ticker}: Net Equity-Kurve vs. Buy & Hold",
                 xaxis_title="Datum",
                 yaxis_title="Equity (€)",
                 height=400,
@@ -324,32 +315,6 @@ for ticker in TICKERS:
             )
             st.plotly_chart(equity_fig, use_container_width=True)
 
-            # Trades Tabelle
-            with st.expander(f"Trades für {ticker}", expanded=False):
-                if not trades_df.empty:
-                    df_tr = trades_df.copy()
-                    df_tr["Date"] = df_tr["Date"].dt.strftime("%Y-%m-%d")
-                    df_tr["CumPnL"] = df_tr.where(df_tr["Typ"] == "Exit")["Net P&L"].cumsum().fillna(method="ffill").fillna(0)
-                    df_tr = df_tr.rename(columns={"Net P&L": "PnL"})
-                    display_cols = ["Date", "Typ", "Price", "Shares", "PnL", "CumPnL", "Fees"]
-                    styled_trades = df_tr[display_cols].style.format({
-                        "Price": "{:.2f}",
-                        "Shares": "{:.4f}",
-                        "PnL": "{:.2f}",
-                        "CumPnL": "{:.2f}",
-                        "Fees": "{:.2f}",
-                    })
-                    show_styled_or_plain(df_tr[display_cols], styled_trades)
-                    st.download_button(
-                        label="Trades als CSV herunterladen",
-                        data=df_tr[display_cols].to_csv(index=False).encode("utf-8"),
-                        file_name=f"trades_{ticker}.csv",
-                        mime="text/csv"
-                    )
-                else:
-                    st.info("Keine Trades vorhanden.")
-        except Exception as e:
-            st.error(f"Fehler bei {ticker}: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # Zusammenfassung
