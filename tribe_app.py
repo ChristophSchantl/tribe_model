@@ -383,20 +383,27 @@ if results:
         bg = colors.get(val, "#ffffff")
         return f"background-color: {bg};"
 
-    styled = summary_df.style.format({
-        "Strategy Net (%)": "{:.2f}",
-        "Strategy Gross (%)": "{:.2f}",
-        "Buy & Hold Net (%)": "{:.2f}",
-        "Volatility (%)": "{:.2f}",
-        "Sharpe-Ratio": "{:.2f}",
-        "Max Drawdown (%)": "{:.2f}",
-        "Calmar-Ratio": "{:.2f}",
-        "Fees (€)": "{:.2f}",
-        "Net P&L (%)": "{:.2f}",
-        "Net P&L (€)": "{:.2f}"
-    }).applymap(lambda v: "font-weight: bold;" if isinstance(v, (int, float)) else "", subset=pd.IndexSlice[:, ["Sharpe-Ratio"]])\\
-      .applymap(color_phase_html, subset=["Phase"])\\
-      .set_caption("Strategie-Performance pro Ticker")
+    styled = (
+        summary_df.style
+        .format({
+            "Strategy Net (%)": "{:.2f}",
+            "Strategy Gross (%)": "{:.2f}",
+            "Buy & Hold Net (%)": "{:.2f}",
+            "Volatility (%)": "{:.2f}",
+            "Sharpe-Ratio": "{:.2f}",
+            "Max Drawdown (%)": "{:.2f}",
+            "Calmar-Ratio": "{:.2f}",
+            "Fees (€)": "{:.2f}",
+            "Net P&L (%)": "{:.2f}",
+            "Net P&L (€)": "{:.2f}"
+        })
+        .applymap(
+            lambda v: "font-weight: bold;" if isinstance(v, (int, float)) else "",
+            subset=pd.IndexSlice[:, ["Sharpe-Ratio"]],
+        )
+        .applymap(color_phase_html, subset=["Phase"])
+        .set_caption("Strategie-Performance pro Ticker")
+    )
 
     st.markdown(styled.to_html(), unsafe_allow_html=True)
     st.download_button(
