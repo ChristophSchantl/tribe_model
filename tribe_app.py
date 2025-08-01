@@ -354,7 +354,6 @@ if results:
             bh_true_returns[ticker] = bh_ret_full
         else:
             bh_true_returns[ticker] = np.nan
-    summary_df["Buy & Hold ab"] = summary_df.index.map(lambda t: round(bh_true_returns.get(t, np.nan), 2))
     summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
 
     total_net_pnl = summary_df["Net P&L (€)"].sum()
