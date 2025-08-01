@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # ─────────────────────────────────────────────────────────────
-# Sidebar / Steuerung
+# Config / Sidebar
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide")
 
@@ -48,7 +48,17 @@ MODEL_PARAMS = dict(
 )
 
 # ─────────────────────────────────────────────────────────────
-# Hilfsfunktionen
+# Helper für Tabellen-Fallback
+# ─────────────────────────────────────────────────────────────
+def show_styled_or_plain(df: pd.DataFrame, styler: pd.io.formats.style.Styler):
+    try:
+        st.markdown(styler.to_html(), unsafe_allow_html=True)
+    except Exception as e:
+        st.warning(f"Styled table konnte nicht gerendert werden, zeige einfache Tabelle. ({e})")
+        st.dataframe(df)
+
+# ─────────────────────────────────────────────────────────────
+# Funktionen
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
@@ -156,7 +166,6 @@ def train_and_signal(
     threshold: float,
     model_params: dict
 ) -> Tuple[pd.DataFrame, List[dict], dict]:
-    # Feature Engineering
     df_local = df.copy()
     df_local["Range"] = df_local["High"].rolling(lookback).max() - df_local["Low"].rolling(lookback).min()
     df_local["SlopeHigh"] = df_local["High"].rolling(lookback).apply(slope, raw=True)
@@ -179,6 +188,8 @@ def train_and_signal(
     return df_bt, trades, compute_performance(df_bt, trades, INIT_CAP)
 
 # ─────────────────────────────────────────────────────────────
+# Haupt
+# ─────────────────────────────────────────────────────────────
 st.title("📈 Signal-basierte Trading-Strategie Backtest")
 
 results = []
@@ -196,22 +207,23 @@ for ticker in TICKERS:
             all_trades[ticker] = trades
             all_dfs[ticker] = df_bt
 
+            # Kennzahlen
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Netto Rendite (%)", f"{metrics['Strategy Net (%)']:.2f}")
             col2.metric("Sharpe", f"{metrics['Sharpe-Ratio']:.2f}")
             col3.metric("Max Drawdown (%)", f"{metrics['Max Drawdown (%)']:.2f}")
             col4.metric("Fees (€)", f"{metrics['Fees (€)']:.2f}")
 
-            # Preis + SignalPlot
+            # Preis + Signal
             price_fig = go.Figure()
             signal_probs = df_bt["SignalProb"]
             norm = (signal_probs - signal_probs.min()) / (signal_probs.max() - signal_probs.min() + 1e-9)
-            colors = px.colors.diverging.RdYlGn  # <--- korrigiert
+            colorscale = px.colors.diverging.RdYlGn
             for i in range(len(df_bt) - 1):
                 seg_x = df_bt.index[i : i + 2]
                 seg_y = df_bt["Close"].iloc[i : i + 2]
                 prob = norm.iloc[i]
-                color_seg = px.colors.sample_colorscale(colors, prob)[0]
+                color_seg = px.colors.sample_colorscale(colorscale, prob)[0]
                 price_fig.add_trace(
                     go.Scatter(
                         x=seg_x,
@@ -269,7 +281,6 @@ for ticker in TICKERS:
                 margin=dict(t=50, b=30, l=40, r=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
-
             st.plotly_chart(price_fig, use_container_width=True)
 
             # Equity-Kurve
@@ -313,6 +324,7 @@ for ticker in TICKERS:
             )
             st.plotly_chart(equity_fig, use_container_width=True)
 
+            # Trades Tabelle
             with st.expander(f"Trades für {ticker}", expanded=False):
                 if not trades_df.empty:
                     df_tr = trades_df.copy()
@@ -320,13 +332,14 @@ for ticker in TICKERS:
                     df_tr["CumPnL"] = df_tr.where(df_tr["Typ"] == "Exit")["Net P&L"].cumsum().fillna(method="ffill").fillna(0)
                     df_tr = df_tr.rename(columns={"Net P&L": "PnL"})
                     display_cols = ["Date", "Typ", "Price", "Shares", "PnL", "CumPnL", "Fees"]
-                    st.dataframe(df_tr[display_cols].style.format({
+                    styled_trades = df_tr[display_cols].style.format({
                         "Price": "{:.2f}",
                         "Shares": "{:.4f}",
                         "PnL": "{:.2f}",
                         "CumPnL": "{:.2f}",
                         "Fees": "{:.2f}",
-                    }).to_html(), unsafe_allow_html=True)
+                    })
+                    show_styled_or_plain(df_tr[display_cols], styled_trades)
                     st.download_button(
                         label="Trades als CSV herunterladen",
                         data=df_tr[display_cols].to_csv(index=False).encode("utf-8"),
@@ -338,6 +351,8 @@ for ticker in TICKERS:
         except Exception as e:
             st.error(f"Fehler bei {ticker}: {e}")
 
+# ─────────────────────────────────────────────────────────────
+# Zusammenfassung
 # ─────────────────────────────────────────────────────────────
 if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
@@ -400,8 +415,7 @@ if results:
         .applymap(color_phase_html, subset=["Phase"])
         .set_caption("Strategie-Performance pro Ticker")
     )
-
-    st.markdown(styled.to_html(), unsafe_allow_html=True)
+    show_styled_or_plain(summary_df, styled)
     st.download_button(
         "Summary als CSV herunterladen",
         summary_df.reset_index().to_csv(index=False).encode("utf-8"),
@@ -409,6 +423,7 @@ if results:
         mime="text/csv"
     )
 
+    # Offene Positionen
     open_positions = []
     for ticker, trades in all_trades.items():
         if trades and trades[-1]["Typ"] == "Entry":
@@ -423,10 +438,11 @@ if results:
     st.subheader("📋 Offene Positionen")
     if open_positions:
         open_df = pd.DataFrame(open_positions)
-        st.dataframe(open_df.style.format({
+        styled_open = open_df.style.format({
             "Entry Price": "{:.2f}",
             "Current Prob.": "{:.4f}"
-        }))
+        })
+        show_styled_or_plain(open_df, styled_open)
         st.download_button(
             "Offene Positionen als CSV",
             open_df.to_csv(index=False).encode("utf-8"),
