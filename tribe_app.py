@@ -244,7 +244,7 @@ for ticker in TICKERS:
                         y=seg_y,
                         mode="lines",
                         showlegend=False,
-                        line=dict(color=color_seg, width=4),
+                        line=dict(color=color_seg, width=2),
                         hoverinfo="skip"
                     )
                 )
