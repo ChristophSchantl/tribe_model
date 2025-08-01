@@ -211,7 +211,7 @@ for ticker in TICKERS:
                 seg_x = df_bt.index[i : i + 2]
                 seg_y = df_bt["Close"].iloc[i : i + 2]
                 prob = norm.iloc[i]
-                color_seg = px.colors.sample_colorscale(colors, prob)
+                color_seg = px.colors.sample_colorscale(colors, prob)[0]
                 price_fig.add_trace(
                     go.Scatter(
                         x=seg_x,
