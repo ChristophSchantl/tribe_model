@@ -207,11 +207,13 @@ for ticker in TICKERS:
             all_trades[ticker] = trades
             all_dfs[ticker] = df_bt
 
-            # Kennzahlen (ohne Fees)
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Netto Rendite (%)", f"{metrics['Strategy Net (%)']:.2f}")
-            col2.metric("Sharpe", f"{metrics['Sharpe-Ratio']:.2f}")
-            col3.metric("Max Drawdown (%)", f"{metrics['Max Drawdown (%)']:.2f}")
+            # Kennzahlen: Strategie Netto vs. Buy & Hold + Sharpe & Drawdown
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
+            col2.metric("Buy & Hold (%)", f"{metrics['Buy & Hold Net (%)']:.2f}")
+            col3.metric("Sharpe", f"{metrics['Sharpe-Ratio']:.2f}")
+            col4.metric("Max Drawdown (%)", f"{metrics['Max Drawdown (%)']:.2f}")
+
 
             # Preis + Signal
             price_fig = go.Figure()
@@ -354,7 +356,6 @@ if results:
             bh_true_returns[ticker] = bh_ret_full
         else:
             bh_true_returns[ticker] = np.nan
-    summary_df["Buy & Hold ab"] = summary_df.index.map(lambda t: round(bh_true_returns.get(t, np.nan), 2))
     summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
 
     total_net_pnl = summary_df["Net P&L (€)"].sum()
