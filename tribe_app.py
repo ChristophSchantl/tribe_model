@@ -207,11 +207,12 @@ for ticker in TICKERS:
             all_trades[ticker] = trades
             all_dfs[ticker] = df_bt
 
-            # Kennzahlen (ohne Fees)
-            col1, col2, col3 = st.columns(3)
+            # Kennzahlen
+            col1, col2, col3, col4 = st.columns(4)
             col1.metric("Netto Rendite (%)", f"{metrics['Strategy Net (%)']:.2f}")
             col2.metric("Sharpe", f"{metrics['Sharpe-Ratio']:.2f}")
             col3.metric("Max Drawdown (%)", f"{metrics['Max Drawdown (%)']:.2f}")
+            col4.metric("Fees (€)", f"{metrics['Fees (€)']:.2f}")
 
             # Preis + Signal
             price_fig = go.Figure()
@@ -282,13 +283,22 @@ for ticker in TICKERS:
             )
             st.plotly_chart(price_fig, use_container_width=True)
 
-            # Equity-Kurve (nur Net Equity + Buy & Hold)
+            # Equity-Kurve
             equity_fig = go.Figure()
             equity_fig.add_trace(
                 go.Scatter(
                     x=df_bt.index,
                     y=df_bt["Equity_Net"],
                     name="Strategy Net Equity",
+                    mode="lines",
+                    hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
+                )
+            )
+            equity_fig.add_trace(
+                go.Scatter(
+                    x=df_bt.index,
+                    y=df_bt["Equity_Gross"],
+                    name="Strategy Gross Equity",
                     mode="lines",
                     hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
                 )
@@ -305,7 +315,7 @@ for ticker in TICKERS:
                 )
             )
             equity_fig.update_layout(
-                title=f"{ticker}: Net Equity-Kurve vs. Buy & Hold",
+                title=f"{ticker}: Equity-Kurve vs. Buy & Hold",
                 xaxis_title="Datum",
                 yaxis_title="Equity (€)",
                 height=400,
@@ -354,6 +364,7 @@ if results:
             bh_true_returns[ticker] = bh_ret_full
         else:
             bh_true_returns[ticker] = np.nan
+    summary_df["Buy & Hold ab"] = summary_df.index.map(lambda t: round(bh_true_returns.get(t, np.nan), 2))
     summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
 
     total_net_pnl = summary_df["Net P&L (€)"].sum()
