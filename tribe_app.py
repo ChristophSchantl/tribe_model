@@ -26,17 +26,17 @@ st.markdown(
     """
     <style>
       .main-header {
-          font-size: 3.5rem;          /* größe anpassen: z.B. 2rem, 4rem, etc. */
+          font-size: clamp(2rem, 5vw, 4rem);
           font-weight: 700;
-          margin: 0;
+          margin: 0 0 0.5rem;
           line-height: 1.1;
       }
     </style>
+    <div class="main-header">📈 AI Signal-based Trading-Strategy</div>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="main-header">📈 AI Signal-based Trading-Strategy</div>', unsafe_allow_html=True)
 
 
 st.sidebar.header("Parameter")
