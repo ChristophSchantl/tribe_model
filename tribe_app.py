@@ -20,8 +20,6 @@ import plotly.express as px
 # ─────────────────────────────────────────────────────────────
 # Config / Sidebar
 # ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide")
-
 st.markdown('<style>h1 { font-size: 3rem !important; }</style>', unsafe_allow_html=True)
 st.title("📈 AI Signal-based Trading-Strategy")
 
