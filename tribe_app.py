@@ -22,6 +22,23 @@ import plotly.express as px
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide")
 
+st.markdown(
+    """
+    <style>
+      .main-header {
+          font-size: 3.5rem;          /* größe anpassen: z.B. 2rem, 4rem, etc. */
+          font-weight: 700;
+          margin: 0;
+          line-height: 1.1;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div class="main-header">📈 AI Signal-based Trading-Strategy</div>', unsafe_allow_html=True)
+
+
 st.sidebar.header("Parameter")
 tickers_input = st.sidebar.text_input("Tickers (Comma-separated)", value="BABA,QBTS,VOW3.DE,INTC")
 TICKERS = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
