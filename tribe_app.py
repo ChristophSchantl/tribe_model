@@ -20,15 +20,13 @@ import plotly.express as px
 # ─────────────────────────────────────────────────────────────
 # Config / Sidebar
 # ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide")
-
 st.markdown(
     """
     <style>
       .main-header {
           font-size: clamp(2rem, 5vw, 4rem);
           font-weight: 700;
-          margin: 0 0 0.5rem;
+          margin: 0 0 1rem;
           line-height: 1.1;
       }
     </style>
@@ -36,7 +34,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 
 
 st.sidebar.header("Parameter")
