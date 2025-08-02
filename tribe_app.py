@@ -20,20 +20,10 @@ import plotly.express as px
 # ─────────────────────────────────────────────────────────────
 # Config / Sidebar
 # ─────────────────────────────────────────────────────────────
-st.markdown(
-    """
-    <style>
-      .main-header {
-          font-size: clamp(2rem, 5vw, 4rem);
-          font-weight: 700;
-          margin: 0 0 1rem;
-          line-height: 1.1;
-      }
-    </style>
-    <div class="main-header">📈 AI Signal-based Trading-Strategy</div>
-    """,
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide")
+
+st.markdown('<style>h1 { font-size: 3rem !important; }</style>', unsafe_allow_html=True)
+st.title("📈 AI Signal-based Trading-Strategy")
 
 
 st.sidebar.header("Parameter")
