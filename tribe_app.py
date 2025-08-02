@@ -22,6 +22,12 @@ import plotly.express as px
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide")
 
+# Nur ein einzelner Titel mit angepasster Größe
+st.markdown("""
+    <h1 style='font-size: 48px;'>Signal-basierte Strategie Backtest</h1>
+""", unsafe_allow_html=True)
+
+
 
 st.sidebar.header("Parameter")
 tickers_input = st.sidebar.text_input("Tickers (Comma-separated)", value="BABA,QBTS,VOW3.DE,INTC")
