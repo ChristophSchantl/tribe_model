@@ -51,12 +51,17 @@ MODEL_PARAMS = dict(
 # ─────────────────────────────────────────────────────────────
 # Helper für Tabellen-Fallback
 # ─────────────────────────────────────────────────────────────
-def show_styled_or_plain(df: pd.DataFrame, styler: pd.io.formats.style.Styler):
+def show_styled_or_plain(df: pd.DataFrame, styler):
     try:
-        st.markdown(styler.to_html(), unsafe_allow_html=True)
+        html = getattr(styler, "to_html", None)
+        if callable(html):
+            st.markdown(html(), unsafe_allow_html=True)
+        else:
+            raise AttributeError("Der übergebene Styler hat keine to_html-Methode")
     except Exception as e:
-        st.warning(f"Styled table konnte nicht gerendert werden, zeige einfache Tabelle. ({e})")
+        st.warning(f"Styled-Tabelle konnte nicht gerendert werden, zeige einfache Tabelle. ({e})")
         st.dataframe(df)
+
 
 # ─────────────────────────────────────────────────────────────
 # Funktionen
