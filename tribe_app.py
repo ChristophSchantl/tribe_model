@@ -182,10 +182,10 @@ def get_price_data_tail_intraday(
         last_bar = intraday.iloc[-1]
         day_key = pd.Timestamp(last_bar.name.date(), tz=LOCAL_TZ)
         daily_row = {
-            "Open":  float(intraday["Open"].iloc[0]),
-            "High":  float(intraday["High"].max()),
-            "Low":   float(intraday["Low"].min()),
-            "Close": float(last_bar["Close"]),
+            "Open":   float(intraday["Open"].iloc[0]),
+            "High":   float(intraday["High"].max()),
+            "Low":    float(intraday["Low"].min()),
+            "Close":  float(last_bar["Close"]),
             "Volume": float(intraday["Volume"].sum()),
         }
         df.loc[day_key] = daily_row
@@ -214,9 +214,12 @@ def train_and_signal_no_leak(
     lookback: int,
     horizon: int,
     threshold: float,
-    model_params: dict
+    model_params: dict,
+    atr_lookback: int
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
     feat = make_features(df, lookback, horizon)
+    # ATR für mögliches Sizing
+    feat["ATR"] = add_atr(df, n=atr_lookback).reindex(feat.index)
 
     hist = feat.iloc[:-1].dropna(subset=["FutureRet"]).copy()
     if len(hist) < 30:
@@ -234,13 +237,14 @@ def train_and_signal_no_leak(
     feat_bt = feat.iloc[:-1].copy()  # letzte Zeile = live/out-of-sample
 
     df_bt, trades = backtest_next_open(
-        feat_bt, ENTRY_PROB, EXIT_PROB, COMMISSION, SLIPPAGE_BPS, INIT_CAP, POS_FRAC
+        feat_bt, ENTRY_PROB, EXIT_PROB, COMMISSION, SLIPPAGE_BPS,
+        INIT_CAP, POS_FRAC, sizing_mode, risk_per_trade_pct, atr_k
     )
     metrics = compute_performance(df_bt, trades, INIT_CAP)
     return feat, df_bt, trades, metrics
 
 # ─────────────────────────────────────────────────────────────
-# Backtester: Signal t -> Ausführung Open t+1 (mit Slippage, PosSize + Prob + Haltedauer)
+# Backtester: Signal t -> Ausführung Open t+1 (incl. Prob & HoldDays)
 # ─────────────────────────────────────────────────────────────
 def backtest_next_open(
     df: pd.DataFrame,
@@ -250,16 +254,14 @@ def backtest_next_open(
     slippage_bps: int,
     init_cap: float,
     pos_frac: float,
+    sizing_mode: str,
+    risk_per_trade_pct: float,
+    atr_k: float,
 ) -> Tuple[pd.DataFrame, List[dict]]:
     """
-    Erwartet df mit: ['Open','Close','High','Low','SignalProb', ...]
-    Ausführung: Signal an Tag t => Trade am Open von t+1.
-    Equity-Bewertung: Tagesende (Close).
-    Kein Pyramiding (0/1-Position).
-
-    Fügt in den Trade-Events zusätzlich hinzu:
-      - 'Prob' (Signal-Wahrscheinlichkeit, die zur Order führte)
-      - 'HoldDays' (nur bei Exit; Entry→Exit Haltedauer in Tagen)
+    Erwartet df mit: ['Open','Close','High','Low','SignalProb','ATR', ...]
+    Ausführung: t-Signal → t+1 Open. Bewertung am Close.
+    Fügt Trades-Feldern 'Prob' und 'HoldDays' (bei Exit) hinzu.
     """
     df = df.copy()
     n = len(df)
@@ -268,9 +270,8 @@ def backtest_next_open(
 
     cash_gross = init_cap
     cash_net   = init_cap
-    shares_gross = 0.0
-    shares_net   = 0.0
-    in_pos = False
+    shares     = 0.0
+    in_pos     = False
     cost_basis_gross = 0.0
     cost_basis_net   = 0.0
     last_entry_date: Optional[pd.Timestamp] = None
@@ -279,7 +280,6 @@ def backtest_next_open(
     cum_pl_net = 0.0
 
     for i in range(n):
-        # 1) Orderausführung am heutigen Open (Signal von gestern)
         if i > 0:
             open_today = float(df["Open"].iloc[i])
             slip_buy  = open_today * (1 + slippage_bps / 10000.0)
@@ -288,44 +288,58 @@ def backtest_next_open(
             date_exec = df.index[i]
 
             if (not in_pos) and prob_prev > entry_thr:
-                invest_gross = cash_gross * pos_frac
-                invest_net   = cash_net   * pos_frac
-                if invest_net > 0:
-                    fee_entry = invest_net * commission
-                    shares_gross = invest_gross / slip_buy
-                    shares_net   = (invest_net - fee_entry) / slip_buy
-                    cost_basis_gross = invest_gross
-                    cost_basis_net   = invest_net - fee_entry
-                    cash_gross -= invest_gross
-                    cash_net   -= invest_net
+                if sizing_mode == "ATR Risk %":
+                    atr_prev = df["ATR"].iloc[i-1] if "ATR" in df.columns else np.nan
+                    if np.isfinite(atr_prev) and atr_prev > 0:
+                        risk_budget    = risk_per_trade_pct * cash_net
+                        risk_per_share = max(atr_prev * atr_k, 1e-8)
+                        shares_by_risk = risk_budget / risk_per_share
+                        shares_by_cash = (cash_net * pos_frac) / slip_buy
+                        target_shares  = max(min(shares_by_risk, shares_by_cash), 0.0)
+                        fee_entry      = (target_shares * slip_buy) * commission
+                        cost           = target_shares * slip_buy
+                    else:  # Fallback: Fixed Fraction
+                        invest_net = cash_net * pos_frac
+                        fee_entry  = invest_net * commission
+                        cost       = invest_net - fee_entry
+                        target_shares = max(cost / slip_buy, 0.0)
+                else:
+                    invest_net   = cash_net * pos_frac
+                    fee_entry    = invest_net * commission
+                    cost         = invest_net - fee_entry
+                    target_shares = max(cost / slip_buy, 0.0)
+
+                if target_shares > 0 and (target_shares * slip_buy + fee_entry) <= cash_net + 1e-9:
+                    shares = target_shares
+                    cost_basis_gross = shares * slip_buy
+                    cost_basis_net   = shares * slip_buy + fee_entry
+                    cash_gross -= cost_basis_gross
+                    cash_net   -= cost_basis_net
                     in_pos = True
                     last_entry_date = date_exec
                     trades.append({
                         "Date": date_exec, "Typ": "Entry", "Price": round(slip_buy, 4),
-                        "Shares": round(shares_net, 4), "Gross P&L": 0.0,
+                        "Shares": round(shares, 4), "Gross P&L": 0.0,
                         "Fees": round(fee_entry, 2), "Net P&L": 0.0,
                         "kum P&L": round(cum_pl_net, 2), "Prob": round(prob_prev, 4),
                         "HoldDays": np.nan
                     })
 
             elif in_pos and prob_prev < exit_thr:
-                gross_value = shares_gross * slip_sell
-                net_value_before_fee = shares_net * slip_sell
-                fee_exit = net_value_before_fee * commission
-
-                pnl_gross = gross_value - cost_basis_gross
-                pnl_net   = (net_value_before_fee - fee_exit) - cost_basis_net
+                gross_value = shares * slip_sell
+                fee_exit    = gross_value * commission
+                pnl_gross   = gross_value - cost_basis_gross
+                pnl_net     = (gross_value - fee_exit) - cost_basis_net
 
                 cash_gross += gross_value
-                cash_net   += (net_value_before_fee - fee_exit)
+                cash_net   += (gross_value - fee_exit)
 
+                hold_days = (date_exec - last_entry_date).days if last_entry_date is not None else np.nan
                 in_pos = False
-                shares_gross = 0.0
-                shares_net   = 0.0
+                shares = 0.0
                 cost_basis_gross = 0.0
                 cost_basis_net   = 0.0
 
-                hold_days = (date_exec - last_entry_date).days if last_entry_date is not None else np.nan
                 cum_pl_net += pnl_net
                 trades.append({
                     "Date": date_exec, "Typ": "Exit", "Price": round(slip_sell, 4),
@@ -336,10 +350,10 @@ def backtest_next_open(
                 })
                 last_entry_date = None
 
-        # 2) Tagesende-Bewertung (Close)
+        # Bewertung am Close
         close_today = float(df["Close"].iloc[i])
-        equity_gross.append(cash_gross + (shares_gross * close_today if in_pos else 0.0))
-        equity_net.append(cash_net + (shares_net * close_today if in_pos else 0.0))
+        equity_gross.append(cash_gross + (shares * close_today if in_pos else 0.0))
+        equity_net.append(cash_net + (shares * close_today if in_pos else 0.0))
 
     df_bt = df.copy()
     df_bt["Equity_Gross"] = equity_gross
@@ -435,8 +449,10 @@ for ticker in TICKERS:
             df = df_full.loc[str(START_DATE):str(END_DATE)].copy()
             last_timestamp_info(df, meta)
 
-            # Trainieren + Backtest (Next Open) ohne Leakage
-            feat, df_bt, trades, metrics = train_and_signal_no_leak(df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS)
+            # Trainieren + Backtest (Next Open) ohne Leakage (+ATR verfügbar)
+            feat, df_bt, trades, metrics = train_and_signal_no_leak(
+                df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS, atr_lookback
+            )
             metrics["Ticker"] = ticker
             results.append(metrics)
             all_trades[ticker] = trades
@@ -533,11 +549,11 @@ if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
     summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
 
-    total_net_pnl = summary_df["Net P&L (€)"].sum()
-    total_fees    = summary_df["Fees (€)"].sum()
+    total_net_pnl  = summary_df["Net P&L (€)"].sum()
+    total_fees     = summary_df["Fees (€)"].sum()
     total_gross_pnl = total_net_pnl + total_fees
-    total_trades  = summary_df["Number of Trades"].sum()
-    total_capital = INIT_CAP * len(summary_df)
+    total_trades   = summary_df["Number of Trades"].sum()
+    total_capital  = INIT_CAP * len(summary_df)
     total_net_return_pct   = total_net_pnl / total_capital * 100
     total_gross_return_pct = total_gross_pnl / total_capital * 100
 
@@ -547,6 +563,16 @@ if results:
     cols[1].metric("Cumulative Trading Costs (€)", f"{total_fees:,.2f}")
     cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
     cols[3].metric("Total Number of Trades",   f"{int(total_trades)}")
+
+    # ── NEU: Gesamtperformance-Kacheln (%)
+    total_strategy_net_pct   = total_net_return_pct
+    total_strategy_gross_pct = total_gross_return_pct
+    bh_total_pct = float(summary_df["Buy & Hold Net (%)"].dropna().mean()) if "Buy & Hold Net (%)" in summary_df.columns else float("nan")
+
+    cols_pct = st.columns(3)
+    cols_pct[0].metric("Strategy Net (%) – total",   f"{total_strategy_net_pct:.2f}")
+    cols_pct[1].metric("Strategy Gross (%) – total", f"{total_strategy_gross_pct:.2f}")
+    cols_pct[2].metric("Buy & Hold Net (%) – total", f"{bh_total_pct:.2f}")
 
     def color_phase_html(val):
         colors = {"Open": "#d0ebff", "Flat": "#f0f0f0"}
@@ -610,11 +636,9 @@ if results:
         st.subheader("📒 Alle Trades (Events) – Filter")
 
         comb_df = pd.DataFrame(combined)
-        # sichere Spalten
         if "Prob" not in comb_df.columns: comb_df["Prob"] = np.nan
         if "HoldDays" not in comb_df.columns: comb_df["HoldDays"] = np.nan
 
-        # Filter-UI
         min_d, max_d = comb_df["Date"].min().date(), comb_df["Date"].max().date()
         tickers_avail = sorted(comb_df["Ticker"].unique().tolist())
 
@@ -624,25 +648,19 @@ if results:
             tick_sel = st.multiselect("Ticker", options=tickers_avail, default=tickers_avail)
         with f2:
             date_range = st.date_input("Zeitraum", value=(min_d, max_d), min_value=min_d, max_value=max_d)
-            prob_min, prob_max = float(np.nanmin(comb_df["Prob"].values)), float(np.nanmax(comb_df["Prob"].values))
+            prob_min = float(np.nanmin(comb_df["Prob"].values)); prob_max = float(np.nanmax(comb_df["Prob"].values))
             if not np.isfinite(prob_min): prob_min = 0.0
             if not np.isfinite(prob_max): prob_max = 1.0
             prob_sel = st.slider("Signal-Wahrscheinlichkeit", min_value=0.0, max_value=1.0,
                                  value=(max(0.0,prob_min), min(1.0,prob_max)), step=0.01)
         with f3:
             hd_series = comb_df.loc[comb_df["Typ"]=="Exit","HoldDays"].dropna()
-            if len(hd_series):
-                hd_min, hd_max = int(hd_series.min()), int(hd_series.max())
-            else:
-                hd_min, hd_max = 0, 60
+            if len(hd_series): hd_min, hd_max = int(hd_series.min()), int(hd_series.max())
+            else: hd_min, hd_max = 0, 60
             hold_sel = st.slider("Haltedauer (nur Exit-Events)", min_value=int(hd_min), max_value=int(hd_max),
                                  value=(int(hd_min), int(hd_max)), step=1)
 
-        # Anwenden
-        if isinstance(date_range, tuple):
-            d_start, d_end = date_range
-        else:
-            d_start, d_end = min_d, max_d
+        d_start, d_end = (date_range if isinstance(date_range, tuple) else (min_d, max_d))
 
         mask = (
             comb_df["Typ"].isin(type_sel) &
@@ -650,7 +668,6 @@ if results:
             (comb_df["Date"].dt.date.between(d_start, d_end)) &
             (comb_df["Prob"].fillna(0.0).between(prob_sel[0], prob_sel[1]))
         )
-        # Haltedauer nur für Exit-Events filtern
         mask &= np.where(
             comb_df["Typ"].eq("Exit"),
             comb_df["HoldDays"].fillna(-1).between(hold_sel[0], hold_sel[1]),
@@ -673,11 +690,10 @@ if results:
             file_name="trades_events_filtered.csv", mime="text/csv"
         )
 
-        # Round-Trips (Entry→Exit) mit Ticker- & Haltedauer-Filter
+        # Round-Trips (Entry→Exit) – mit Ticker/Haltedauer/Zeitraum
         rt_df = compute_round_trips(all_trades)
         if not rt_df.empty:
             st.subheader("🔁 Abgeschlossene Trades (Round-Trips) – Filter")
-            # Filter-UI
             r_min_d, r_max_d = rt_df["Entry Date"].min().date(), rt_df["Exit Date"].max().date()
             r_ticks = sorted(rt_df["Ticker"].unique().tolist())
             r1, r2, r3 = st.columns([1.2, 1.2, 1.6])
@@ -690,11 +706,7 @@ if results:
                 rt_hold = st.slider("Haltedauer", min_value=int(hd_min), max_value=int(hd_max),
                                     value=(int(hd_min), int(hd_max)), step=1, key="rt_hold")
 
-            if isinstance(rt_date, tuple):
-                rds, rde = rt_date
-            else:
-                rds, rde = r_min_d, r_max_d
-
+            rds, rde = (rt_date if isinstance(rt_date, tuple) else (r_min_d, r_max_d))
             rt_mask = (
                 rt_df["Ticker"].isin(rt_tick_sel) &
                 (rt_df["Entry Date"].dt.date.between(rds, rde)) &
@@ -706,7 +718,8 @@ if results:
             rt_disp["Exit Date"]  = rt_disp["Exit Date"].dt.strftime("%Y-%m-%d")
 
             styled_rt = rt_disp.style.format({
-                "Entry Price":"{:.2f}","Exit Price":"{:.2f}","PnL Net (€)":"{:.2f}","Fees (€)":"{:.2f}","Return (%)":"{:.2f}",
+                "Entry Price":"{:.2f}","Exit Price":"{:.2f}",
+                "PnL Net (€)":"{:.2f}","Fees (€)":"{:.2f}","Return (%)":"{:.2f}",
                 "Entry Prob":"{:.4f}","Exit Prob":"{:.4f}"
             })
             show_styled_or_plain(rt_disp, styled_rt)
