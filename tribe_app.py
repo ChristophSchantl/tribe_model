@@ -1,4 +1,5 @@
 # streamlit_app.py
+# -*- coding: utf-8 -*-
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -61,6 +62,13 @@ fallback_last_session = st.sidebar.checkbox("Fallback: letzte Session verwenden 
 
 exec_mode = st.sidebar.selectbox("Execution Mode", ["Next Open (backtest+live)", "Market-On-Close (live only)"])
 moc_cutoff_min = st.sidebar.number_input("MOC Cutoff (Minuten vor Close, nur live)", min_value=5, max_value=60, value=15, step=5)
+
+# Neuer Umschalter: Intraday-Chart-Typ
+intraday_chart_type = st.sidebar.selectbox(
+    "Intraday-Chart",
+    ["Candlestick (OHLC)", "Close-Linie"],
+    index=0
+)
 
 st.sidebar.markdown("**Modellparameter**")
 n_estimators  = st.sidebar.number_input("n_estimators",  min_value=10, max_value=500, value=100, step=10)
@@ -201,10 +209,6 @@ def get_price_data_tail_intraday(
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
 def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: int = 10, interval: str = "5m") -> pd.DataFrame:
-    """
-    Holt intraday-Daten (interval) für ~days_buffer Tage und beschränkt
-    anschließend auf die letzten `sessions` Handelstage.
-    """
     tk = yf.Ticker(ticker)
     intr = tk.history(period=f"{days_buffer}d", interval=interval, auto_adjust=True, actions=False, prepost=False)
     if intr.empty:
@@ -213,7 +217,6 @@ def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: in
         intr.index = intr.index.tz_localize("UTC")
     intr.index = intr.index.tz_convert(LOCAL_TZ)
 
-    # letzte N Handelstage bestimmen
     unique_dates = pd.Index(intr.index.normalize().unique())
     keep_dates = set(unique_dates[-sessions:])
     mask = intr.index.normalize().isin(keep_dates)
@@ -369,7 +372,7 @@ def backtest_next_open(
                 last_entry_date = None
 
         # --- Bewertung am Tagesende (Close) ---
-        close_today = float(df["Close"].iloc[i])   # ← hier war zuvor der Syntaxfehler
+        close_today = float(df["Close"].iloc[i])
         equity_gross.append(cash_gross + (shares * close_today if in_pos else 0.0))
         equity_net.append(cash_net + (shares * close_today if in_pos else 0.0))
 
@@ -377,7 +380,6 @@ def backtest_next_open(
     df_bt["Equity_Gross"] = equity_gross
     df_bt["Equity_Net"]   = equity_net
     return df_bt, trades
-
 
 # ─────────────────────────────────────────────────────────────
 # Performance-Kennzahlen
@@ -528,29 +530,39 @@ for ticker in TICKERS:
             with chart_cols[0]:
                 st.plotly_chart(price_fig, use_container_width=True)
 
-            # --- Intraday-Chart (letzte 5 Handelstage) als Candlestick ---
+            # --- Intraday-Chart (letzte 5 Handelstage) mit Umschalter ---
             intra = get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval=intraday_interval)
             with chart_cols[1]:
                 if intra.empty:
                     st.info("Keine Intraday-Daten verfügbar (Ticker/Intervall/Zeitraum).")
                 else:
                     intr_fig = go.Figure()
-                    intr_fig.add_trace(
-                        go.Candlestick(
-                            x=intra.index,
-                            open=intra["Open"], high=intra["High"],
-                            low=intra["Low"],  close=intra["Close"],
-                            name="OHLC (intraday)",
-                            increasing_line_width=1, decreasing_line_width=1
-                        )
-                    )
 
-                    # Events im 5-Tage-Fenster: Marker am Session-Open, Y = tatsächlicher Exec-Preis
+                    if intraday_chart_type == "Candlestick (OHLC)":
+                        intr_fig.add_trace(
+                            go.Candlestick(
+                                x=intra.index,
+                                open=intra["Open"], high=intra["High"],
+                                low=intra["Low"],  close=intra["Close"],
+                                name="OHLC (intraday)",
+                                increasing_line_width=1, decreasing_line_width=1
+                            )
+                        )
+                    else:
+                        intr_fig.add_trace(
+                            go.Scatter(
+                                x=intra.index, y=intra["Close"],
+                                mode="lines", name="Close (intraday)",
+                                hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Close: %{y:.2f}<extra></extra>"
+                            )
+                        )
+
+                    # Events der letzten 5 Handelstage
                     if not trades_df.empty:
                         tdf = trades_df.copy()
                         tdf["Date"] = pd.to_datetime(tdf["Date"])
                         last_days = set(pd.Index(intra.index.normalize().unique()))
-                        ev_recent = tdf[tdf["Date"].dt.normalize().isin(last_days)]
+                        ev_recent = tdf[tdf["Date"].dt.normalize().isin(last_days)].copy()
 
                         for typ, color, symbol in [("Entry","green","triangle-up"), ("Exit","red","triangle-down")]:
                             xs, ys = [], []
@@ -558,8 +570,12 @@ for ticker in TICKERS:
                                 hit = ev_recent[(ev_recent["Typ"] == typ) & (ev_recent["Date"].dt.normalize() == d)]
                                 if hit.empty:
                                     continue
-                                xs.append(day_slice.index.min())        # Session-Start
-                                ys.append(float(hit["Price"].iloc[-1])) # Exec-Preis (inkl. Slippage)
+                                ts0 = day_slice.index.min()  # Session-Start
+                                if intraday_chart_type == "Candlestick (OHLC)":
+                                    y_val = float(hit["Price"].iloc[-1])           # Exec-Preis (Open inkl. Slippage)
+                                else:
+                                    y_val = float(day_slice["Close"].iloc[0])      # auf Linie snappen
+                                xs.append(ts0); ys.append(y_val)
                             if xs:
                                 intr_fig.add_trace(
                                     go.Scatter(
@@ -575,7 +591,6 @@ for ticker in TICKERS:
                         height=420, margin=dict(t=50, b=30, l=40, r=20),
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                     )
-                    # Session-Guides
                     for _, day_slice in intra.groupby(intra.index.normalize()):
                         intr_fig.add_vline(x=day_slice.index.min(), line_width=1, line_dash="dot", opacity=0.3)
 
