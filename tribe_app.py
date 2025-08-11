@@ -42,7 +42,7 @@ THRESH = st.sidebar.number_input("Threshold für Target", min_value=0.0, max_val
 ENTRY_PROB = st.sidebar.slider("Entry Threshold (P(Signal))", min_value=0.0, max_value=1.0, value=0.63, step=0.01)
 EXIT_PROB  = st.sidebar.slider("Exit Threshold (P(Signal))",  min_value=0.0, max_value=1.0, value=0.46, step=0.01)
 
-COMMISSION = st.sidebar.number_input("Commission (ad valorem, z.B. 0.001=10bp)", min_value=0.0, max_value=0.02, value=0.0005, step=0.0001, format="%.4f")
+COMMISSION = st.sidebar.number_input("Commission (ad valorem, z.B. 0.001=10bp)", min_value=0.0, max_value=0.02, value=0.004, step=0.0001, format="%.4f")
 SLIPPAGE_BPS = st.sidebar.number_input("Slippage (bp je Ausführung)", min_value=0, max_value=50, value=5, step=1)
 POS_FRAC = st.sidebar.slider("Positionsgröße (% des Kapitals je Trade)", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
 
