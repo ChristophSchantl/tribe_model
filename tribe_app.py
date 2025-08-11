@@ -296,6 +296,7 @@ def backtest_next_open(
     cum_pl_net = 0.0
 
     for i in range(n):
+        # --- Ausführung am Open von t (Signal von t-1) ---
         if i > 0:
             open_today = float(df["Open"].iloc[i])
             slip_buy  = open_today * (1 + slippage_bps / 10000.0)
@@ -304,8 +305,9 @@ def backtest_next_open(
             date_exec = df.index[i]
 
             if (not in_pos) and prob_prev > entry_thr:
+                # Positionsgröße
                 if sizing_mode == "ATR Risk %":
-                    atr_prev = df["ATR"].iloc[i-1] if "ATR" in df.columns else np.nan
+                    atr_prev = df.get("ATR", pd.Series(index=df.index)).iloc[i-1]
                     if np.isfinite(atr_prev) and atr_prev > 0:
                         risk_budget    = risk_per_trade_pct * cash_net
                         risk_per_share = max(atr_prev * atr_k, 1e-8)
@@ -366,7 +368,8 @@ def backtest_next_open(
                 })
                 last_entry_date = None
 
-        close_today = float(df["Close"].iloc{i} if isinstance(i,int) else df["Close"].iloc[i])
+        # --- Bewertung am Tagesende (Close) ---
+        close_today = float(df["Close"].iloc[i])   # ← hier war zuvor der Syntaxfehler
         equity_gross.append(cash_gross + (shares * close_today if in_pos else 0.0))
         equity_net.append(cash_net + (shares * close_today if in_pos else 0.0))
 
@@ -374,6 +377,7 @@ def backtest_next_open(
     df_bt["Equity_Gross"] = equity_gross
     df_bt["Equity_Net"]   = equity_net
     return df_bt, trades
+
 
 # ─────────────────────────────────────────────────────────────
 # Performance-Kennzahlen
