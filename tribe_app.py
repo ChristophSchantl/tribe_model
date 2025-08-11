@@ -14,7 +14,6 @@ from typing import Tuple, List, Dict
 from zoneinfo import ZoneInfo
 
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 import plotly.graph_objects as go
@@ -69,7 +68,7 @@ MODEL_PARAMS = dict(
 )
 
 # ─────────────────────────────────────────────────────────────
-# Helper für Tabellen-Fallback
+# Helper
 # ─────────────────────────────────────────────────────────────
 def show_styled_or_plain(df: pd.DataFrame, styler):
     try:
@@ -90,18 +89,43 @@ def last_timestamp_info(df: pd.DataFrame):
     ts = df.index[-1]
     st.caption(f"Letzter Datenpunkt: {ts.strftime('%Y-%m-%d %H:%M %Z')}")
 
+# Name-Lookup (gecached)
+@st.cache_data(show_spinner=False, ttl=24*60*60)
+def get_ticker_name(ticker: str) -> str:
+    try:
+        tk = yf.Ticker(ticker)
+        info = {}
+        try:
+            info = tk.get_info()  # yfinance >=0.2 (kann langsam sein)
+        except Exception:
+            info = getattr(tk, "info", {}) or {}
+        for k in ("shortName", "longName", "displayName", "companyName", "name"):
+            if k in info and info[k]:
+                return str(info[k])
+        # Fallback: ISIN/WKN etc. nicht zuverlässig in fast_info
+    except Exception:
+        pass
+    return ticker  # Fallback auf Ticker
+
 # ─────────────────────────────────────────────────────────────
 # Daten: Daily + Intraday-Snapshot mergen
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
-def get_price_data(ticker: str, years: int = 2, use_live: bool = True) -> pd.DataFrame:
+def get_price_data(
+    ticker: str,
+    years: int = 2,
+    use_live: bool = True,
+    exec_mode_key: str = "Next Open (backtest+live)",
+    moc_cutoff_min_val: int = 15
+) -> pd.DataFrame:
     """
     Holt 1D-Daten für 'years' Jahre und ergänzt – falls verfügbar – den heutigen
     Balken durch Intraday-Infos (Open/High/Low aggregiert, Close=letzter Print).
+    Cache-Schlüssel berücksichtigt Execution-Mode & Cutoff.
     """
     tk = yf.Ticker(ticker)
 
-    # Daily via period ist robuster als start/end bzgl. Inclusivity
+    # Daily via period (robuster als start/end bzgl. Inclusivity)
     df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
     if df.empty:
         raise ValueError(f"Keine Daten für {ticker}")
@@ -120,31 +144,32 @@ def get_price_data(ticker: str, years: int = 2, use_live: bool = True) -> pd.Dat
                     intraday.index = intraday.index.tz_localize("UTC")
                 intraday.index = intraday.index.tz_convert(LOCAL_TZ)
 
-                # Falls MOC-Cutoff gewünscht: bis Close - cutoff begrenzen
-                # (Close-Zeit kennt yfinance nicht zuverlässig, daher begrenzen wir bis "jetzt - cutoff")
-                now_local = datetime.now(LOCAL_TZ)
-                cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min))
-                intraday_cut = intraday.loc[:cutoff_time] if exec_mode.startswith("Market-On-Close") else intraday
+                # Für MOC live: bis jetzt - cutoff begrenzen (Proxy, da Close je Exchange variiert)
+                if exec_mode_key.startswith("Market-On-Close"):
+                    now_local = datetime.now(LOCAL_TZ)
+                    cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min_val))
+                    intraday_use = intraday.loc[:cutoff_time]
+                else:
+                    intraday_use = intraday
 
-                if not intraday_cut.empty:
-                    last_bar = intraday_cut.iloc[-1]
-                    day_key = pd.Timestamp(last_bar.name.date()).replace(tzinfo=LOCAL_TZ)
-
+                if not intraday_use.empty:
+                    last_bar = intraday_use.iloc[-1]
+                    day_key = pd.Timestamp(last_bar.name.date()).tz_localize(LOCAL_TZ)
                     daily_row = {
-                        "Open":  float(intraday_cut["Open"].iloc[0]),
-                        "High":  float(intraday_cut["High"].max()),
-                        "Low":   float(intraday_cut["Low"].min()),
+                        "Open":  float(intraday_use["Open"].iloc[0]),
+                        "High":  float(intraday_use["High"].max()),
+                        "Low":   float(intraday_use["Low"].min()),
                         "Close": float(last_bar["Close"]),
-                        "Volume": float(intraday_cut["Volume"].sum()),
+                        "Volume": float(intraday_use["Volume"].sum()),
                     }
                     df.loc[day_key] = daily_row
                     df = df.sort_index()
         except Exception:
-            # Fallback nur über fast_info.last_price
+            # Fallback über fast_info.last_price
             try:
                 lp = tk.fast_info.last_price
                 if np.isfinite(lp):
-                    today_key = pd.Timestamp(datetime.now(LOCAL_TZ).date()).replace(tzinfo=LOCAL_TZ)
+                    today_key = pd.Timestamp(datetime.now(LOCAL_TZ).date()).tz_localize(LOCAL_TZ)
                     if today_key in df.index:
                         df.loc[today_key, "Close"] = float(lp)
                     else:
@@ -348,7 +373,10 @@ for ticker in TICKERS:
         st.subheader(f"{ticker}")
         try:
             # Daten laden (2 Jahre, inkl. optionalem Intraday-Merge)
-            df_full = get_price_data(ticker, years=2, use_live=use_live)
+            df_full = get_price_data(
+                ticker, years=2, use_live=use_live,
+                exec_mode_key=exec_mode, moc_cutoff_min_val=moc_cutoff_min
+            )
             # Auf UI-Zeitraum beschränken
             df = df_full.loc[str(START_DATE):str(END_DATE)].copy()
             last_timestamp_info(df)
@@ -468,25 +496,31 @@ for ticker in TICKERS:
             )
             st.plotly_chart(equity_fig, use_container_width=True)
 
-            # Trades Tabelle (Next Open Backtest)
+            # Trades Tabelle (Next Open Backtest) – mit Ticker & Kurzname
             with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
                 if not trades_df.empty:
                     df_tr = trades_df.copy()
-                    df_tr["Date"] = df_tr["Date"].dt.strftime("%Y-%m-%d")
+                    df_tr["Ticker"] = ticker
+                    df_tr["Name"] = get_ticker_name(ticker)
+                    df_tr["Date"] = pd.to_datetime(df_tr["Date"])
+                    df_tr["DateStr"] = df_tr["Date"].dt.strftime("%Y-%m-%d")
+                    # kumulative PnL nur auf Exits zählen und vorwärts füllen
                     df_tr["CumPnL"] = df_tr.where(df_tr["Typ"] == "Exit")["Net P&L"].cumsum().fillna(method="ffill").fillna(0)
                     df_tr = df_tr.rename(columns={"Net P&L": "PnL"})
-                    display_cols = ["Date", "Typ", "Price", "Shares", "PnL", "CumPnL", "Fees"]
-                    styled_trades = df_tr[display_cols].style.format({
+                    display_cols = ["Ticker", "Name", "DateStr", "Typ", "Price", "Shares", "PnL", "CumPnL", "Fees"]
+                    df_disp = df_tr[display_cols].rename(columns={"DateStr": "Date"})
+                    styled_trades = df_disp.style.format({
                         "Price": "{:.2f}",
                         "Shares": "{:.4f}",
                         "PnL": "{:.2f}",
                         "CumPnL": "{:.2f}",
                         "Fees": "{:.2f}",
                     })
-                    show_styled_or_plain(df_tr[display_cols], styled_trades)
+                    show_styled_or_plain(df_disp, styled_trades)
                     st.download_button(
-                        label="Trades als CSV herunterladen",
-                        data=df_tr[display_cols].to_csv(index=False).encode("utf-8"),
+                        label=f"Trades {ticker} als CSV",
+                        data=df_tr[["Ticker","Name","Date","Typ","Price","Shares","PnL","CumPnL","Fees"]]
+                            .to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8"),
                         file_name=f"trades_{ticker}.csv",
                         mime="text/csv"
                     )
@@ -572,31 +606,28 @@ if results:
         mime="text/csv"
     )
 
-# ─────────────────────────────────────────────────────────────
-# Offene Positionen – sortierbar nach Entry-Datum
-# ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Offene Positionen – sortierbar + mit Kurzname
+    # ─────────────────────────────────────────────────────────
     st.subheader("📋 Open Positions (Next Open Backtest)")
-    
+
     open_positions = []
     for ticker, trades in all_trades.items():
         if trades and trades[-1]["Typ"] == "Entry":
             last_entry = next(t for t in reversed(trades) if t["Typ"] == "Entry")
-            # aktuelles Signal:
             prob = all_feat[ticker]["SignalProb"].iloc[-1]
-            # Datum als Timestamp behalten (für Sortierung)
             entry_ts = pd.to_datetime(last_entry["Date"])
-    
             open_positions.append({
                 "Ticker": ticker,
+                "Name": get_ticker_name(ticker),
                 "Entry Date": entry_ts,
                 "Entry Price": round(last_entry["Price"], 2),
                 "Current Prob.": round(float(prob), 4),
             })
-    
+
     if open_positions:
         open_df = pd.DataFrame(open_positions)
-    
-        # UI: Sortier-Reihenfolge wählen
+
         sort_order = st.radio(
             "Sortierung nach Eröffnungsdatum",
             options=["Neueste zuerst", "Älteste zuerst"],
@@ -604,20 +635,18 @@ if results:
             key="sort_open_positions"
         )
         ascending = (sort_order == "Älteste zuerst")
-    
-        # Sortierung (stabil, falls gleiche Daten)
         open_df = open_df.sort_values("Entry Date", ascending=ascending, kind="mergesort")
-    
-        # Für Anzeige Datum schön formatieren, CSV behält echtes Datum
+
+        # Anzeige hübsch formatieren (Datum als String), CSV behält echtes Datum
         open_df_display = open_df.copy()
         open_df_display["Entry Date"] = open_df_display["Entry Date"].dt.strftime("%Y-%m-%d")
-    
+
         styled_open = open_df_display.style.format({
             "Entry Price": "{:.2f}",
             "Current Prob.": "{:.4f}"
         })
         show_styled_or_plain(open_df_display, styled_open)
-    
+
         st.download_button(
             "Offene Positionen als CSV",
             open_df.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8"),
@@ -627,5 +656,38 @@ if results:
     else:
         st.success("Keine offenen Positionen.")
 
+    # ─────────────────────────────────────────────────────────
+    # Gesamte Trade-Übersicht über alle Ticker – mit Kurzname
+    # ─────────────────────────────────────────────────────────
+    if all_trades:
+        combined = []
+        for tk, tr in all_trades.items():
+            tk_name = get_ticker_name(tk)
+            for row in tr:
+                r = dict(row)  # Kopie
+                r["Ticker"] = tk
+                r["Name"] = tk_name
+                # Datum normalisieren
+                if isinstance(r.get("Date"), (pd.Timestamp, datetime)):
+                    r["Date"] = pd.to_datetime(r["Date"]).strftime("%Y-%m-%d")
+                combined.append(r)
+
+        if combined:
+            st.subheader("📒 Alle Trades (kombiniert)")
+            comb_df = pd.DataFrame(combined)
+            wanted = ["Ticker", "Name", "Date", "Typ", "Price", "Shares", "Net P&L", "kum P&L", "Fees"]
+            cols_present = [c for c in wanted if c in comb_df.columns]
+            comb_df = comb_df[cols_present].copy()
+
+            fmt_map = {"Price": "{:.2f}", "Shares": "{:.4f}", "Net P&L": "{:.2f}", "kum P&L": "{:.2f}", "Fees": "{:.2f}"}
+            styled_comb = comb_df.style.format(fmt_map)
+            show_styled_or_plain(comb_df, styled_comb)
+
+            st.download_button(
+                "Alle Trades als CSV",
+                comb_df.to_csv(index=False).encode("utf-8"),
+                file_name="all_trades_combined.csv",
+                mime="text/csv"
+            )
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Stelle sicher, dass mindestens ein Ticker korrekt eingegeben ist und genügend Daten vorhanden sind.")
