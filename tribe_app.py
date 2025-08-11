@@ -475,12 +475,14 @@ for ticker in TICKERS:
             all_dfs[ticker] = df_bt
             all_feat[ticker] = feat
 
-            # Kennzahlen
-            c1, c2, c3, c4 = st.columns(4)
+            # Kennzahlen + Trades
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
             c2.metric("Buy & Hold (%)",      f"{metrics['Buy & Hold Net (%)']:.2f}")
             c3.metric("Sharpe",               f"{metrics['Sharpe-Ratio']:.2f}")
             c4.metric("Max Drawdown (%)",     f"{metrics['Max Drawdown (%)']:.2f}")
+            c5.metric("Trades (Round-Trips)", f"{int(metrics['Number of Trades'])}")
+
 
             # Preis + Signal (links)  UND Intraday-Chart (rechts)
             chart_cols = st.columns(2)
