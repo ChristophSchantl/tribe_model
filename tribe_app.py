@@ -151,7 +151,7 @@ def get_price_data_tail_intraday(
         return df, meta
 
     try:
-        intraday = tk.history(period="1d", interval=interval, auto_adjust=True, actions=False)
+        intraday = tk.history(period="1d", interval=interval, auto_adjust=True, actions=False, prepost=False)
         if not intraday.empty:
             if intraday.index.tz is None:
                 intraday.index = intraday.index.tz_localize("UTC")
@@ -168,7 +168,7 @@ def get_price_data_tail_intraday(
 
     if intraday.empty and fallback_last_session:
         try:
-            intraday5 = tk.history(period="5d", interval=interval, auto_adjust=True, actions=False)
+            intraday5 = tk.history(period="5d", interval=interval, auto_adjust=True, actions=False, prepost=False)
             if not intraday5.empty:
                 if intraday5.index.tz is None:
                     intraday5.index = intraday5.index.tz_localize("UTC")
@@ -214,11 +214,10 @@ def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: in
     intr.index = intr.index.tz_convert(LOCAL_TZ)
 
     # letzte N Handelstage bestimmen
-    unique_dates = sorted({ts.date() for ts in intr.index})
-    last_n = set(unique_dates[-sessions:])
-    mask = np.array([ts.date() in last_n for ts in intr.index])
-    intr5 = intr.loc[mask].copy()
-    return intr5
+    unique_dates = pd.Index(intr.index.normalize().unique())
+    keep_dates = set(unique_dates[-sessions:])
+    mask = intr.index.normalize().isin(keep_dates)
+    return intr.loc[mask].copy()
 
 # ─────────────────────────────────────────────────────────────
 # Features & Training ohne Leakage
@@ -367,7 +366,7 @@ def backtest_next_open(
                 })
                 last_entry_date = None
 
-        close_today = float(df["Close"].iloc[i])
+        close_today = float(df["Close"].iloc{i} if isinstance(i,int) else df["Close"].iloc[i])
         equity_gross.append(cash_gross + (shares * close_today if in_pos else 0.0))
         equity_net.append(cash_net + (shares * close_today if in_pos else 0.0))
 
@@ -475,7 +474,7 @@ for ticker in TICKERS:
             all_dfs[ticker] = df_bt
             all_feat[ticker] = feat
 
-            # Kennzahlen + Trades
+            # Kennzahlen + Trade-Zahl
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
             c2.metric("Buy & Hold (%)",      f"{metrics['Buy & Hold Net (%)']:.2f}")
@@ -483,11 +482,10 @@ for ticker in TICKERS:
             c4.metric("Max Drawdown (%)",     f"{metrics['Max Drawdown (%)']:.2f}")
             c5.metric("Trades (Round-Trips)", f"{int(metrics['Number of Trades'])}")
 
-
-            # Preis + Signal (links)  UND Intraday-Chart (rechts)
+            # Charts nebeneinander
             chart_cols = st.columns(2)
 
-            # --- Langfrist-Preis mit Segmentfarben + Trades ---
+            # --- Daily Preis mit farbigen Segmenten + Events ---
             df_plot = feat.copy()
             price_fig = go.Figure()
             price_fig.add_trace(go.Scatter(
@@ -526,48 +524,38 @@ for ticker in TICKERS:
             with chart_cols[0]:
                 st.plotly_chart(price_fig, use_container_width=True)
 
-            # --- NEU: Intraday-Chart (letzte 5 Handelstage) ---
             # --- Intraday-Chart (letzte 5 Handelstage) als Candlestick ---
             intra = get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval=intraday_interval)
-            
             with chart_cols[1]:
-                if not intra.empty:
+                if intra.empty:
+                    st.info("Keine Intraday-Daten verfügbar (Ticker/Intervall/Zeitraum).")
+                else:
                     intr_fig = go.Figure()
-            
-                    # Candlestick statt Close-Linie
                     intr_fig.add_trace(
                         go.Candlestick(
                             x=intra.index,
-                            open=intra["Open"],
-                            high=intra["High"],
-                            low=intra["Low"],
-                            close=intra["Close"],
+                            open=intra["Open"], high=intra["High"],
+                            low=intra["Low"],  close=intra["Close"],
                             name="OHLC (intraday)",
-                            increasing_line_width=1,
-                            decreasing_line_width=1,
+                            increasing_line_width=1, decreasing_line_width=1
                         )
                     )
-            
-                    # Marker: Ausführung am Tages-Open (Next-Open) mit exaktem Trade-Preis
-                    trades_df = pd.DataFrame(trades)
+
+                    # Events im 5-Tage-Fenster: Marker am Session-Open, Y = tatsächlicher Exec-Preis
                     if not trades_df.empty:
-                        trades_df["Date"] = pd.to_datetime(trades_df["Date"])
-                        last5_days = sorted({ts.date() for ts in intra.index})
-                        ev_recent = trades_df[trades_df["Date"].dt.date.isin(last5_days)].copy()
-            
-                        for typ, color, symbol in [("Entry", "green", "triangle-up"), ("Exit", "red", "triangle-down")]:
-                            sub = ev_recent[ev_recent["Typ"] == typ]
+                        tdf = trades_df.copy()
+                        tdf["Date"] = pd.to_datetime(tdf["Date"])
+                        last_days = set(pd.Index(intra.index.normalize().unique()))
+                        ev_recent = tdf[tdf["Date"].dt.normalize().isin(last_days)]
+
+                        for typ, color, symbol in [("Entry","green","triangle-up"), ("Exit","red","triangle-down")]:
                             xs, ys = [], []
-                            for _, row in sub.iterrows():
-                                d = row["Date"].date()
-                                day_slice = intra.loc[[ts for ts in intra.index if ts.date() == d]]
-                                if day_slice.empty:
+                            for d, day_slice in intra.groupby(intra.index.normalize()):
+                                hit = ev_recent[(ev_recent["Typ"] == typ) & (ev_recent["Date"].dt.normalize() == d)]
+                                if hit.empty:
                                     continue
-                                ts0 = day_slice.index.min()          # offizieller Session-Start
-                                price_exec = float(row["Price"])     # tatsächlich gebuchter Preis (inkl. Slippage)
-                                xs.append(ts0)
-                                ys.append(price_exec)
-            
+                                xs.append(day_slice.index.min())        # Session-Start
+                                ys.append(float(hit["Price"].iloc[-1])) # Exec-Preis (inkl. Slippage)
                             if xs:
                                 intr_fig.add_trace(
                                     go.Scatter(
@@ -577,23 +565,17 @@ for ticker in TICKERS:
                                     )
                                 )
 
-        intr_fig.update_layout(
-            title=f"{ticker}: Intraday – letzte 5 Handelstage ({intraday_interval})",
-            xaxis_title="Zeit",
-            yaxis_title="Preis",
-            height=420,
-            margin=dict(t=50, b=30, l=40, r=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        # Optional: vertikale Linien je Session-Start
-        for d in sorted({ts.date() for ts in intra.index}):
-            ts0 = intra.loc[[ts for ts in intra.index if ts.date()==d]].index.min()
-            intr_fig.add_vline(x=ts0, line_width=1, line_dash="dot", opacity=0.3)
+                    intr_fig.update_layout(
+                        title=f"{ticker}: Intraday – letzte 5 Handelstage ({intraday_interval})",
+                        xaxis_title="Zeit", yaxis_title="Preis",
+                        height=420, margin=dict(t=50, b=30, l=40, r=20),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    # Session-Guides
+                    for _, day_slice in intra.groupby(intra.index.normalize()):
+                        intr_fig.add_vline(x=day_slice.index.min(), line_width=1, line_dash="dot", opacity=0.3)
 
-        st.plotly_chart(intr_fig, use_container_width=True)
-    else:
-        st.info("Keine Intraday-Daten verfügbar (Ticker/Intervall/Zeitraum).")
-
+                    st.plotly_chart(intr_fig, use_container_width=True)
 
             # Equity-Kurve (unter den Charts)
             eq = go.Figure()
