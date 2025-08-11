@@ -572,30 +572,60 @@ if results:
         mime="text/csv"
     )
 
-    # Offene Positionen (auf Basis Next Open Backtest)
+# ─────────────────────────────────────────────────────────────
+# Offene Positionen – sortierbar nach Entry-Datum
+# ─────────────────────────────────────────────────────────────
+    st.subheader("📋 Open Positions (Next Open Backtest)")
+    
     open_positions = []
     for ticker, trades in all_trades.items():
         if trades and trades[-1]["Typ"] == "Entry":
             last_entry = next(t for t in reversed(trades) if t["Typ"] == "Entry")
+            # aktuelles Signal:
             prob = all_feat[ticker]["SignalProb"].iloc[-1]
+            # Datum als Timestamp behalten (für Sortierung)
+            entry_ts = pd.to_datetime(last_entry["Date"])
+    
             open_positions.append({
                 "Ticker": ticker,
-                "Entry Date": pd.to_datetime(last_entry["Date"]).strftime("%Y-%m-%d"),
+                "Entry Date": entry_ts,
                 "Entry Price": round(last_entry["Price"], 2),
                 "Current Prob.": round(float(prob), 4),
             })
-    st.subheader("📋 Open Positions (Next Open Backtest)")
+    
     if open_positions:
         open_df = pd.DataFrame(open_positions)
-        styled_open = open_df.style.format({"Entry Price": "{:.2f}", "Current Prob.": "{:.4f}"})
-        show_styled_or_plain(open_df, styled_open)
+    
+        # UI: Sortier-Reihenfolge wählen
+        sort_order = st.radio(
+            "Sortierung nach Eröffnungsdatum",
+            options=["Neueste zuerst", "Älteste zuerst"],
+            horizontal=True,
+            key="sort_open_positions"
+        )
+        ascending = (sort_order == "Älteste zuerst")
+    
+        # Sortierung (stabil, falls gleiche Daten)
+        open_df = open_df.sort_values("Entry Date", ascending=ascending, kind="mergesort")
+    
+        # Für Anzeige Datum schön formatieren, CSV behält echtes Datum
+        open_df_display = open_df.copy()
+        open_df_display["Entry Date"] = open_df_display["Entry Date"].dt.strftime("%Y-%m-%d")
+    
+        styled_open = open_df_display.style.format({
+            "Entry Price": "{:.2f}",
+            "Current Prob.": "{:.4f}"
+        })
+        show_styled_or_plain(open_df_display, styled_open)
+    
         st.download_button(
             "Offene Positionen als CSV",
-            open_df.to_csv(index=False).encode("utf-8"),
+            open_df.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8"),
             file_name="open_positions.csv",
             mime="text/csv"
         )
     else:
         st.success("Keine offenen Positionen.")
+
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Stelle sicher, dass mindestens ein Ticker korrekt eingegeben ist und genügend Daten vorhanden sind.")
