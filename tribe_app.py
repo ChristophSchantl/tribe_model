@@ -59,6 +59,7 @@ use_live = st.sidebar.checkbox("Letzten Tag intraday aggregieren (falls verfügb
 intraday_interval = st.sidebar.selectbox("Intraday-Intervall (Tail)", ["1m", "2m", "5m"], index=0)
 fallback_last_session = st.sidebar.checkbox("Fallback: letzte Session verwenden (wenn heute leer)", value=False)
 highlight_intraday_tail = st.sidebar.checkbox("„Heute (intraday)“ im Chart hervorheben", value=True)
+show_intraday_line = st.sidebar.checkbox("Intraday-Verlauf (heute) im Chart zeigen", value=True)
 
 exec_mode = st.sidebar.selectbox(
     "Execution Mode",
@@ -131,7 +132,7 @@ def add_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return atr
 
 # ─────────────────────────────────────────────────────────────
-# Daten: 1D-Historie + NUR-HEUTE Intraday-Tail
+# Daten: 1D-Historie + NUR-HEUTE Intraday-Tail (+ Rückgabe der Minutenreihe)
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
 def get_price_data_tail_intraday(
@@ -142,7 +143,13 @@ def get_price_data_tail_intraday(
     fallback_last_session: bool = False,
     exec_mode_key: str = "Next Open (backtest+live)",
     moc_cutoff_min_val: int = 15,
-) -> Tuple[pd.DataFrame, dict]:
+) -> Tuple[pd.DataFrame, dict, pd.DataFrame]:
+    """
+    1D-Historie laden; NUR den letzten Tag (heute/letzte Session) durch Intraday
+    aggregieren (Open/High/Low agg., Close=letzter Print). Zusätzlich die
+    Minutenreihe (intraday_df) zurückgeben, um den Verlauf zu plotten.
+    Return: (df_daily, meta, intraday_df)
+    """
     tk = yf.Ticker(ticker)
 
     df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
@@ -154,10 +161,11 @@ def get_price_data_tail_intraday(
     df.index = df.index.tz_convert(LOCAL_TZ)
 
     meta = {"tail_is_intraday": False, "tail_ts": None}
+    intraday = pd.DataFrame()
 
     if not use_tail:
         df.dropna(subset=["High", "Low", "Close"], inplace=True)
-        return df, meta
+        return df, meta, intraday
 
     # Heutiger Intraday-Snapshot
     try:
@@ -166,8 +174,6 @@ def get_price_data_tail_intraday(
             if intraday.index.tz is None:
                 intraday.index = intraday.index.tz_localize("UTC")
             intraday.index = intraday.index.tz_convert(LOCAL_TZ)
-        else:
-            intraday = pd.DataFrame()
     except Exception:
         intraday = pd.DataFrame()
 
@@ -208,7 +214,7 @@ def get_price_data_tail_intraday(
         meta["tail_ts"] = last_bar.name
 
     df.dropna(subset=["High", "Low", "Close"], inplace=True)
-    return df, meta
+    return df, meta, intraday
 
 # ─────────────────────────────────────────────────────────────
 # Features & Training ohne Leakage
@@ -260,7 +266,7 @@ def train_and_signal_no_leak(
     return feat, df_bt, trades, metrics
 
 # ─────────────────────────────────────────────────────────────
-# Backtester: Signal t -> Ausführung Open t+1 (mit Slippage, PosSize)
+# Backtester: Signal t -> Ausführung Open t+1
 # ─────────────────────────────────────────────────────────────
 def backtest_next_open(
     df: pd.DataFrame,
@@ -275,10 +281,8 @@ def backtest_next_open(
     atr_k: float,
 ) -> Tuple[pd.DataFrame, List[dict]]:
     """
-    Erwartet df mit Spalten: ['Open','Close','High','Low','SignalProb', 'ATR', ...]
-    Ausführung: Signal an Tag t => Trade am Open von t+1.
-    Equity-Bewertung: Tagesende (Close).
-    Kein Pyramiding (0/1-Position).
+    Erwartet df mit ['Open','Close','High','Low','SignalProb','ATR', ...]
+    Ausführung: Signal an Tag t => Trade am Open von t+1. Tagesende-Bewertung (Close).
     """
     df = df.copy()
     n = len(df)
@@ -296,7 +300,7 @@ def backtest_next_open(
     cum_pl_net = 0.0
 
     for i in range(n):
-        # 1) Orderausführung am heutigen Open (Signal von gestern)
+        # 1) Orderausführung am Open (Signal von gestern)
         if i > 0:
             open_today = float(df["Open"].iloc[i])
             slip_buy   = open_today * (1 + slippage_bps / 10000.0)
@@ -308,25 +312,23 @@ def backtest_next_open(
                 if sizing_mode == "ATR Risk %":
                     atr_prev = df["ATR"].iloc[i-1] if "ATR" in df.columns else np.nan
                     if not np.isfinite(atr_prev) or atr_prev <= 0:
-                        # Fallback: fixed fraction
                         invest_net = cash_net * pos_frac
                         fee_entry  = invest_net * commission
                         target_shares = max((invest_net - fee_entry) / slip_buy, 0.0)
-                        cost        = target_shares * slip_buy
+                        cost = target_shares * slip_buy
                     else:
-                        risk_budget      = risk_per_trade_pct * cash_net
-                        risk_per_share   = max(atr_prev * atr_k, 1e-8)
-                        shares_by_risk   = risk_budget / risk_per_share
-                        shares_by_cash   = (cash_net * pos_frac) / slip_buy
-                        target_shares    = max(min(shares_by_risk, shares_by_cash), 0.0)
-                        cost             = target_shares * slip_buy
-                        fee_entry        = cost * commission
+                        risk_budget    = risk_per_trade_pct * cash_net
+                        risk_per_share = max(atr_prev * atr_k, 1e-8)
+                        shares_by_risk = risk_budget / risk_per_share
+                        shares_by_cash = (cash_net * pos_frac) / slip_buy
+                        target_shares  = max(min(shares_by_risk, shares_by_cash), 0.0)
+                        cost = target_shares * slip_buy
+                        fee_entry = cost * commission
                 else:
-                    # Fixed Fraction
                     invest_net   = cash_net * pos_frac
                     fee_entry    = invest_net * commission
                     target_shares = max((invest_net - fee_entry) / slip_buy, 0.0)
-                    cost         = target_shares * slip_buy
+                    cost = target_shares * slip_buy
 
                 if target_shares > 0 and cost + fee_entry <= cash_net + 1e-9:
                     shares = target_shares
@@ -455,8 +457,8 @@ for ticker in TICKERS:
     with st.expander(f"🔍 Analyse für {ticker}", expanded=False):
         st.subheader(f"{ticker}")
         try:
-            # 1D + nur-heute Intraday Tail
-            df_full, meta = get_price_data_tail_intraday(
+            # 1D + nur-heute Intraday Tail (+ Minutenreihe)
+            df_full, meta, intraday_df = get_price_data_tail_intraday(
                 ticker,
                 years=2,
                 use_tail=use_live,
@@ -500,6 +502,7 @@ for ticker in TICKERS:
                     hovertemplate="Datum: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>"
                 )
             )
+            # farbcodierte Signal-Segmente
             signal_probs = df_plot["SignalProb"]
             norm = (signal_probs - signal_probs.min()) / (signal_probs.max() - signal_probs.min() + 1e-9)
             colorscale = px.colors.diverging.RdYlGn
@@ -510,6 +513,26 @@ for ticker in TICKERS:
                 color_seg = px.colors.sample_colorscale(colorscale, prob)[0]
                 price_fig.add_trace(
                     go.Scatter(x=seg_x, y=seg_y, mode="lines", showlegend=False, line=dict(color=color_seg, width=2), hoverinfo="skip")
+                )
+
+            # Intraday-Verlauf (heute) als Linie
+            if show_intraday_line and meta.get("tail_is_intraday") and intraday_df is not None and not intraday_df.empty:
+                try:
+                    if intraday_df.index.tz is None:
+                        intraday_df.index = intraday_df.index.tz_localize("UTC").tz_convert(LOCAL_TZ)
+                    else:
+                        intraday_df.index = intraday_df.index.tz_convert(LOCAL_TZ)
+                except Exception:
+                    pass
+                price_fig.add_trace(
+                    go.Scatter(
+                        x=intraday_df.index,
+                        y=intraday_df["Close"],
+                        mode="lines",
+                        name="Intraday (heute)",
+                        line=dict(width=2),
+                        hovertemplate="Zeit: %{x|%Y-%m-%d %H:%M %Z}<br>Close: %{y:.2f}<extra></extra>"
+                    )
                 )
 
             # Entry/Exit Marker
@@ -550,7 +573,7 @@ for ticker in TICKERS:
             price_fig.update_layout(
                 title=f"{ticker}: Preis mit Signal-Wahrscheinlichkeit",
                 xaxis_title="Datum", yaxis_title="Preis",
-                height=400, margin=dict(t=50, b=30, l=40, r=20),
+                height=420, margin=dict(t=50, b=30, l=40, r=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(price_fig, use_container_width=True)
@@ -710,7 +733,7 @@ if results:
     else:
         st.success("Keine offenen Positionen.")
 
-    # Kombinierte Events (Entries/Exits) + Filter
+    # Kombinierte Events (Entries/Exits) + Filter & Round-Trips
     if all_trades:
         combined = []
         for tk, tr in all_trades.items():
@@ -727,7 +750,7 @@ if results:
 
             # Filter-UI
             min_d, max_d = comb_df["Date"].min().date(), comb_df["Date"].max().date()
-            f_col1, f_col2, f_col3 = st.columns([1,1,2])
+            f_col1, f_col2, _ = st.columns([1,1,2])
             with f_col1:
                 type_sel = st.multiselect("Typ", options=["Entry","Exit"], default=["Entry","Exit"])
             with f_col2:
@@ -736,11 +759,7 @@ if results:
                     d_start, d_end = date_range
                 else:
                     d_start, d_end = min_d, max_d
-            with f_col3:
-                st.write("")  # spacing
-                st.write("")
 
-            # Anwenden
             mask = comb_df["Typ"].isin(type_sel) & (comb_df["Date"].dt.date.between(d_start, d_end))
             comb_f = comb_df.loc[mask].copy()
             comb_f_disp = comb_f.copy()
