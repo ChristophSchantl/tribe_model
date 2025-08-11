@@ -1,3 +1,5 @@
+# streamlit_app.py
+
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*figure layout has changed to tight.*")
@@ -7,8 +9,9 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 from math import sqrt
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Tuple, List, Dict
+from zoneinfo import ZoneInfo
 
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.model_selection import train_test_split
@@ -18,23 +21,40 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # ─────────────────────────────────────────────────────────────
-# Config / Sidebar
+# Config / Globals
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide")
+LOCAL_TZ = ZoneInfo("Europe/Zurich")
 
-
+# ─────────────────────────────────────────────────────────────
+# Sidebar / Parameter
+# ─────────────────────────────────────────────────────────────
 st.sidebar.header("Parameter")
 tickers_input = st.sidebar.text_input("Tickers (Comma-separated)", value="BABA,QBTS,VOW3.DE,INTC")
 TICKERS = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+
 START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2024-01-01"))
-END_DATE = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.now().date()))
+END_DATE = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.now(LOCAL_TZ).date()))
+
 LOOKBACK = st.sidebar.number_input("Lookback (Tage)", min_value=10, max_value=252, value=60, step=5)
 HORIZON = st.sidebar.number_input("Horizon (Tage)", min_value=1, max_value=10, value=2)
 THRESH = st.sidebar.number_input("Threshold für Target", min_value=0.0, max_value=0.1, value=0.02, step=0.005, format="%.3f")
+
 ENTRY_PROB = st.sidebar.slider("Entry Threshold (P(Signal))", min_value=0.0, max_value=1.0, value=0.63, step=0.01)
-EXIT_PROB = st.sidebar.slider("Exit Threshold (P(Signal))", min_value=0.0, max_value=1.0, value=0.46, step=0.01)
-COMMISSION = st.sidebar.number_input("Commission (per Trade, Share)", min_value=0.0, max_value=0.02, value=0.005, step=0.001, format="%.4f")
+EXIT_PROB  = st.sidebar.slider("Exit Threshold (P(Signal))",  min_value=0.0, max_value=1.0, value=0.46, step=0.01)
+
+COMMISSION = st.sidebar.number_input("Commission (ad valorem, z.B. 0.001=10bp)", min_value=0.0, max_value=0.02, value=0.0005, step=0.0001, format="%.4f")
+SLIPPAGE_BPS = st.sidebar.number_input("Slippage (bp je Ausführung)", min_value=0, max_value=50, value=5, step=1)
+POS_FRAC = st.sidebar.slider("Positionsgröße (% des Kapitals je Trade)", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
+
 INIT_CAP = st.sidebar.number_input("Initial Capital  (€)", min_value=1000.0, value=10_000.0, step=1000.0, format="%.2f")
+use_live = st.sidebar.checkbox("Heute Intraday-Preis verwenden (falls verfügbar)", value=True)
+
+exec_mode = st.sidebar.selectbox(
+    "Execution Mode",
+    ["Next Open (backtest+live)", "Market-On-Close (live only)"]
+)
+moc_cutoff_min = st.sidebar.number_input("MOC Cutoff (Minuten vor Close, nur live)", min_value=5, max_value=60, value=15, step=5)
 
 st.sidebar.markdown("**Modellparameter**")
 n_estimators = st.sidebar.number_input("n_estimators", min_value=10, max_value=500, value=100, step=10)
@@ -62,80 +82,229 @@ def show_styled_or_plain(df: pd.DataFrame, styler):
         st.warning(f"Styled-Tabelle konnte nicht gerendert werden, zeige einfache Tabelle. ({e})")
         st.dataframe(df)
 
-
-# ─────────────────────────────────────────────────────────────
-# Funktionen
-# ─────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def download_data(ticker: str, start: str, end: str) -> pd.DataFrame:
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df["Close"] = df["Close"].interpolate()
-    df.dropna(subset=["High", "Low", "Close"], inplace=True)
-    return df
-
 def slope(arr: np.ndarray) -> float:
     x = np.arange(len(arr))
     return np.polyfit(x, arr, 1)[0]
 
-def backtest_brutto_netto(
+def last_timestamp_info(df: pd.DataFrame):
+    ts = df.index[-1]
+    st.caption(f"Letzter Datenpunkt: {ts.strftime('%Y-%m-%d %H:%M %Z')}")
+
+# ─────────────────────────────────────────────────────────────
+# Daten: Daily + Intraday-Snapshot mergen
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=120)
+def get_price_data(ticker: str, years: int = 2, use_live: bool = True) -> pd.DataFrame:
+    """
+    Holt 1D-Daten für 'years' Jahre und ergänzt – falls verfügbar – den heutigen
+    Balken durch Intraday-Infos (Open/High/Low aggregiert, Close=letzter Print).
+    """
+    tk = yf.Ticker(ticker)
+
+    # Daily via period ist robuster als start/end bzgl. Inclusivity
+    df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
+    if df.empty:
+        raise ValueError(f"Keine Daten für {ticker}")
+
+    # Zeitzone säubern
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(LOCAL_TZ)
+
+    # Optional: heutigen Intraday-Balken einpflegen
+    if use_live:
+        try:
+            intraday = tk.history(period="1d", interval="1m", auto_adjust=True, actions=False)
+            if not intraday.empty:
+                if intraday.index.tz is None:
+                    intraday.index = intraday.index.tz_localize("UTC")
+                intraday.index = intraday.index.tz_convert(LOCAL_TZ)
+
+                # Falls MOC-Cutoff gewünscht: bis Close - cutoff begrenzen
+                # (Close-Zeit kennt yfinance nicht zuverlässig, daher begrenzen wir bis "jetzt - cutoff")
+                now_local = datetime.now(LOCAL_TZ)
+                cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min))
+                intraday_cut = intraday.loc[:cutoff_time] if exec_mode.startswith("Market-On-Close") else intraday
+
+                if not intraday_cut.empty:
+                    last_bar = intraday_cut.iloc[-1]
+                    day_key = pd.Timestamp(last_bar.name.date()).replace(tzinfo=LOCAL_TZ)
+
+                    daily_row = {
+                        "Open":  float(intraday_cut["Open"].iloc[0]),
+                        "High":  float(intraday_cut["High"].max()),
+                        "Low":   float(intraday_cut["Low"].min()),
+                        "Close": float(last_bar["Close"]),
+                        "Volume": float(intraday_cut["Volume"].sum()),
+                    }
+                    df.loc[day_key] = daily_row
+                    df = df.sort_index()
+        except Exception:
+            # Fallback nur über fast_info.last_price
+            try:
+                lp = tk.fast_info.last_price
+                if np.isfinite(lp):
+                    today_key = pd.Timestamp(datetime.now(LOCAL_TZ).date()).replace(tzinfo=LOCAL_TZ)
+                    if today_key in df.index:
+                        df.loc[today_key, "Close"] = float(lp)
+                    else:
+                        last_close = float(df["Close"].iloc[-1])
+                        df.loc[today_key, ["Open","High","Low","Close","Volume"]] = [last_close, lp, lp, lp, 0.0]
+                    df = df.sort_index()
+            except Exception:
+                pass
+
+    df.dropna(subset=["High", "Low", "Close"], inplace=True)
+    return df
+
+# ─────────────────────────────────────────────────────────────
+# Features & Training ohne Leakage
+# ─────────────────────────────────────────────────────────────
+def make_features(df: pd.DataFrame, lookback: int, horizon: int) -> pd.DataFrame:
+    feat = df.copy()
+    feat["Range"] = feat["High"].rolling(lookback).max() - feat["Low"].rolling(lookback).min()
+    feat["SlopeHigh"] = feat["High"].rolling(lookback).apply(slope, raw=True)
+    feat["SlopeLow"]  = feat["Low"].rolling(lookback).apply(slope, raw=True)
+    feat = feat.iloc[lookback-1:].copy()
+    feat["FutureRet"] = feat["Close"].shift(-horizon) / feat["Close"] - 1
+    return feat
+
+@st.cache_data(show_spinner=False, ttl=120)
+def train_and_signal_no_leak(
+    df: pd.DataFrame,
+    lookback: int,
+    horizon: int,
+    threshold: float,
+    model_params: dict
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
+    """
+    Trainiert bis vorletzte Zeile (ohne Leakage), erzeugt Signal-Prob für alle,
+    backtestet auf Next-Open-Execution (bis vorletzte Zeile).
+    """
+    feat = make_features(df, lookback, horizon)
+
+    # Historie fürs Training (bis vorletzte Zeile)
+    hist = feat.iloc[:-1].dropna(subset=["FutureRet"]).copy()
+    if len(hist) < 30:
+        raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
+
+    hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
+    X_cols = ["Range","SlopeHigh","SlopeLow"]
+    X_train, y_train = hist[X_cols].values, hist["Target"].values
+
+    scaler = StandardScaler().fit(X_train)
+    model  = GradientBoostingClassifier(**model_params).fit(scaler.transform(X_train), y_train)
+
+    # Score für alle (inkl. der letzten "live" Zeile)
+    feat["SignalProb"] = model.predict_proba(scaler.transform(feat[X_cols].values))[:,1]
+
+    # Backtest nur bis vorletzte Zeile (letzte ist Live/Out-of-sample)
+    feat_bt = feat.iloc[:-1].copy()
+
+    df_bt, trades = backtest_next_open(
+        feat_bt, ENTRY_PROB, EXIT_PROB, COMMISSION, SLIPPAGE_BPS, INIT_CAP, POS_FRAC
+    )
+    metrics = compute_performance(df_bt, trades, INIT_CAP)
+    return feat, df_bt, trades, metrics
+
+# ─────────────────────────────────────────────────────────────
+# Backtester: Signal t -> Ausführung Open t+1 (mit Slippage, PosSize)
+# ─────────────────────────────────────────────────────────────
+def backtest_next_open(
     df: pd.DataFrame,
     entry_thr: float,
     exit_thr: float,
     commission: float,
-    init_cap: float
+    slippage_bps: int,
+    init_cap: float,
+    pos_frac: float,
 ) -> Tuple[pd.DataFrame, List[dict]]:
-    cap_gross, cap_net = init_cap, init_cap
-    pos_gross = pos_net = 0
-    shares_gross = shares_net = 0.0
-    cost_basis_gross = cost_basis_net = 0.0
+    """
+    Erwartet df mit Spalten: ['Open','Close','High','Low','SignalProb', ...]
+    Ausführung: Signal an Tag t => Trade am Open von t+1.
+    Equity-Bewertung: Tagesende (Close).
+    Kein Pyramiding (0/1-Position).
+    """
+    df = df.copy()
+    n = len(df)
+    if n < 2:
+        raise ValueError("Zu wenige Datenpunkte für Backtest.")
+
+    cash_gross = init_cap
+    cash_net = init_cap
+    shares_gross = 0.0
+    shares_net = 0.0
+    in_pos = False
+    cost_basis_gross = 0.0
+    cost_basis_net = 0.0
+
     equity_gross, equity_net, trades = [], [], []
     cum_pl_net = 0.0
 
-    for date, row in df.iterrows():
-        prob, price = row["SignalProb"], row["Close"]
-        if pos_net == 0 and prob > entry_thr:
-            shares_gross = cap_gross / price
-            cost_basis_gross = cap_gross
-            cap_gross = 0.0
-            pos_gross = 1
-            fee_entry = cap_net * commission
-            net_cap = cap_net - fee_entry
-            shares_net = net_cap / price
-            cost_basis_net = net_cap
-            cap_net = 0.0
-            pos_net = 1
-            trades.append({
-                "Date": date, "Typ": "Entry", "Price": price,
-                "Shares": round(shares_net, 4), "Gross P&L": 0.0,
-                "Fees": round(fee_entry, 2), "Net P&L": 0.0, "kum P&L": round(cum_pl_net, 2)
-            })
-        elif pos_net == 1 and prob < exit_thr:
-            gross_exit_value = shares_gross * price
-            pnl_gross = gross_exit_value - cost_basis_gross
-            cap_gross = gross_exit_value
-            pos_gross = 0
-            gross_value = shares_net * price
-            fee_exit = gross_value * commission
-            net_proceeds = gross_value - fee_exit
-            pnl_net = net_proceeds - cost_basis_net
-            cap_net = net_proceeds
-            pos_net = 0
-            cum_pl_net += pnl_net
-            trades.append({
-                "Date": date, "Typ": "Exit", "Price": price,
-                "Shares": round(shares_net, 4), "Gross P&L": round(pnl_gross, 2),
-                "Fees": round(fee_exit, 2), "Net P&L": round(pnl_net, 2), "kum P&L": round(cum_pl_net, 2)
-            })
-        equity_gross.append(shares_gross * price if pos_gross else cap_gross)
-        equity_net.append(shares_net * price if pos_net else cap_net)
+    for i in range(n):
+        # 1) Orderausführung am heutigen Open (Signal von gestern)
+        if i > 0:
+            open_today = float(df["Open"].iloc[i])
+            slip_buy  = open_today * (1 + slippage_bps / 10000.0)
+            slip_sell = open_today * (1 - slippage_bps / 10000.0)
+            prob_prev = float(df["SignalProb"].iloc[i-1])
+            date_exec = df.index[i]
+
+            if (not in_pos) and prob_prev > entry_thr:
+                invest_gross = cash_gross * pos_frac
+                invest_net   = cash_net   * pos_frac
+                if invest_net > 0:
+                    fee_entry = invest_net * commission
+                    shares_gross = invest_gross / slip_buy
+                    shares_net   = (invest_net - fee_entry) / slip_buy
+                    cost_basis_gross = invest_gross
+                    cost_basis_net   = invest_net - fee_entry
+                    cash_gross -= invest_gross
+                    cash_net   -= invest_net
+                    in_pos = True
+                    trades.append({
+                        "Date": date_exec, "Typ": "Entry", "Price": round(slip_buy, 4),
+                        "Shares": round(shares_net, 4), "Gross P&L": 0.0,
+                        "Fees": round(fee_entry, 2), "Net P&L": 0.0, "kum P&L": round(cum_pl_net, 2)
+                    })
+
+            elif in_pos and prob_prev < exit_thr:
+                gross_value = shares_gross * slip_sell
+                net_value_before_fee = shares_net * slip_sell
+                fee_exit = net_value_before_fee * commission
+
+                pnl_gross = gross_value - cost_basis_gross
+                pnl_net   = (net_value_before_fee - fee_exit) - cost_basis_net
+
+                cash_gross += gross_value
+                cash_net   += (net_value_before_fee - fee_exit)
+
+                in_pos = False
+                shares_gross = 0.0
+                shares_net   = 0.0
+                cost_basis_gross = 0.0
+                cost_basis_net   = 0.0
+
+                cum_pl_net += pnl_net
+                trades.append({
+                    "Date": date_exec, "Typ": "Exit", "Price": round(slip_sell, 4),
+                    "Shares": 0.0, "Gross P&L": round(pnl_gross, 2),
+                    "Fees": round(fee_exit, 2), "Net P&L": round(pnl_net, 2), "kum P&L": round(cum_pl_net, 2)
+                })
+
+        # 2) Tagesende-Bewertung (Close)
+        close_today = float(df["Close"].iloc[i])
+        equity_gross.append(cash_gross + (shares_gross * close_today if in_pos else 0.0))
+        equity_net.append(cash_net + (shares_net * close_today if in_pos else 0.0))
 
     df_bt = df.copy()
     df_bt["Equity_Gross"] = equity_gross
-    df_bt["Equity_Net"] = equity_net
+    df_bt["Equity_Net"]   = equity_net
     return df_bt, trades
 
+# ─────────────────────────────────────────────────────────────
+# Performance-Kennzahlen
+# ─────────────────────────────────────────────────────────────
 def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float) -> dict:
     net_ret = (df_bt["Equity_Net"].iloc[-1] / init_cap - 1) * 100
     rets = df_bt["Equity_Net"].pct_change().dropna()
@@ -164,85 +333,64 @@ def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float
         "Net P&L (€)": round(net_eur, 2),
     }
 
-@st.cache_data(show_spinner=False)
-def train_and_signal(
-    df: pd.DataFrame,
-    lookback: int,
-    horizon: int,
-    threshold: float,
-    model_params: dict
-) -> Tuple[pd.DataFrame, List[dict], dict]:
-    df_local = df.copy()
-    df_local["Range"] = df_local["High"].rolling(lookback).max() - df_local["Low"].rolling(lookback).min()
-    df_local["SlopeHigh"] = df_local["High"].rolling(lookback).apply(slope, raw=True)
-    df_local["SlopeLow"] = df_local["Low"].rolling(lookback).apply(slope, raw=True)
-    df_local = df_local.iloc[lookback - 1 :].copy()
-    df_local["FutureRet"] = df_local["Close"].shift(-horizon) / df_local["Close"] - 1
-    df_local.dropna(inplace=True)
-    df_local["Target"] = (df_local["FutureRet"] > threshold).astype(int)
-
-    X, y = df_local[["Range", "SlopeHigh", "SlopeLow"]], df_local["Target"]
-    if len(y) < 10:
-        raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
-    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.3, shuffle=False)
-    scaler = StandardScaler().fit(X_train)
-    model = GradientBoostingClassifier(**model_params)
-    model.fit(scaler.transform(X_train), y_train)
-    df_local["SignalProb"] = model.predict_proba(scaler.transform(X))[:, 1]
-
-    df_bt, trades = backtest_brutto_netto(df_local, ENTRY_PROB, EXIT_PROB, COMMISSION, INIT_CAP)
-    return df_bt, trades, compute_performance(df_bt, trades, INIT_CAP)
-
 # ─────────────────────────────────────────────────────────────
 # Haupt
 # ─────────────────────────────────────────────────────────────
 st.markdown("<h1 style='font-size: 36px;'>📈 AI Signal-based Trading-Strategy</h1>", unsafe_allow_html=True)
 
-
 results = []
 all_trades: Dict[str, List[dict]] = {}
 all_dfs: Dict[str, pd.DataFrame] = {}
+all_feat: Dict[str, pd.DataFrame] = {}
 
 for ticker in TICKERS:
     with st.expander(f"🔍 Analyse für {ticker}", expanded=False):
         st.subheader(f"{ticker}")
         try:
-            df = download_data(ticker, START_DATE.strftime("%Y-%m-%d"), END_DATE.strftime("%Y-%m-%d"))
-            df_bt, trades, metrics = train_and_signal(df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS)
+            # Daten laden (2 Jahre, inkl. optionalem Intraday-Merge)
+            df_full = get_price_data(ticker, years=2, use_live=use_live)
+            # Auf UI-Zeitraum beschränken
+            df = df_full.loc[str(START_DATE):str(END_DATE)].copy()
+            last_timestamp_info(df)
+
+            # Trainieren + Backtest (Next Open) ohne Leakage
+            feat, df_bt, trades, metrics = train_and_signal_no_leak(df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS)
             metrics["Ticker"] = ticker
             results.append(metrics)
             all_trades[ticker] = trades
             all_dfs[ticker] = df_bt
+            all_feat[ticker] = feat
 
-            # Kennzahlen: Strategie Netto vs. Buy & Hold + Sharpe & Drawdown
+            # Kennzahlen
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
             col2.metric("Buy & Hold (%)", f"{metrics['Buy & Hold Net (%)']:.2f}")
             col3.metric("Sharpe", f"{metrics['Sharpe-Ratio']:.2f}")
             col4.metric("Max Drawdown (%)", f"{metrics['Max Drawdown (%)']:.2f}")
 
-            # Preis + Signal
-            price_fig = go.Figure()
+            # Hinweis bei MOC-Modus
+            if exec_mode.startswith("Market-On-Close"):
+                st.info("MOC-Modus: Live-Signal unten. Backtest-/Kennzahlen oben basieren auf 'Next Open' (robust & ohne Leakage).")
 
-            # Close-Linie im Hintergrund, dünn und halbtransparent
+            # Preis + Signal (farbige Segmente)
+            df_plot = feat.copy()
+            price_fig = go.Figure()
             price_fig.add_trace(
                 go.Scatter(
-                    x=df_bt.index,
-                    y=df_bt["Close"],
+                    x=df_plot.index,
+                    y=df_plot["Close"],
                     mode="lines",
                     name="Close",
                     line=dict(color="rgba(0,0,0,0.4)", width=1),
                     hovertemplate="Datum: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>"
                 )
             )
-
-            # Signal-farbige Segmente darüber
-            signal_probs = df_bt["SignalProb"]
+            signal_probs = df_plot["SignalProb"]
             norm = (signal_probs - signal_probs.min()) / (signal_probs.max() - signal_probs.min() + 1e-9)
             colorscale = px.colors.diverging.RdYlGn
-            for i in range(len(df_bt) - 1):
-                seg_x = df_bt.index[i : i + 2]
-                seg_y = df_bt["Close"].iloc[i : i + 2]
+            for i in range(len(df_plot) - 1):
+                seg_x = df_plot.index[i : i + 2]
+                seg_y = df_plot["Close"].iloc[i : i + 2]
                 prob = norm.iloc[i]
                 color_seg = px.colors.sample_colorscale(colorscale, prob)[0]
                 price_fig.add_trace(
@@ -263,22 +411,16 @@ for ticker in TICKERS:
                 exits = trades_df[trades_df["Typ"] == "Exit"]
                 price_fig.add_trace(
                     go.Scatter(
-                        x=entries["Date"],
-                        y=entries["Price"],
-                        mode="markers",
-                        marker_symbol="triangle-up",
-                        marker=dict(size=12, color="green"),
+                        x=entries["Date"], y=entries["Price"], mode="markers",
+                        marker_symbol="triangle-up", marker=dict(size=12, color="green"),
                         name="Entry",
                         hovertemplate="Entry<br>Datum: %{x|%Y-%m-%d}<br>Preis: %{y:.2f}<extra></extra>"
                     )
                 )
                 price_fig.add_trace(
                     go.Scatter(
-                        x=exits["Date"],
-                        y=exits["Price"],
-                        mode="markers",
-                        marker_symbol="triangle-down",
-                        marker=dict(size=12, color="red"),
+                        x=exits["Date"], y=exits["Price"], mode="markers",
+                        marker_symbol="triangle-down", marker=dict(size=12, color="red"),
                         name="Exit",
                         hovertemplate="Exit<br>Datum: %{x|%Y-%m-%d}<br>Preis: %{y:.2f}<extra></extra>"
                     )
@@ -287,20 +429,20 @@ for ticker in TICKERS:
             price_fig.update_layout(
                 title=f"{ticker}: Preis mit Signal-Wahrscheinlichkeit",
                 xaxis_title="Datum",
-                yaxis_title="Preis (€)",
+                yaxis_title="Preis",
                 height=400,
                 margin=dict(t=50, b=30, l=40, r=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(price_fig, use_container_width=True)
 
-            # Equity-Kurve (nur Net Equity + Buy & Hold)
+            # Equity-Kurve (Next Open Backtest)
             equity_fig = go.Figure()
             equity_fig.add_trace(
                 go.Scatter(
                     x=df_bt.index,
                     y=df_bt["Equity_Net"],
-                    name="Strategy Net Equity",
+                    name="Strategy Net Equity (Next Open)",
                     mode="lines",
                     hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"
                 )
@@ -326,8 +468,8 @@ for ticker in TICKERS:
             )
             st.plotly_chart(equity_fig, use_container_width=True)
 
-            # Trades Tabelle
-            with st.expander(f"Trades für {ticker}", expanded=False):
+            # Trades Tabelle (Next Open Backtest)
+            with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
                 if not trades_df.empty:
                     df_tr = trades_df.copy()
                     df_tr["Date"] = df_tr["Date"].dt.strftime("%Y-%m-%d")
@@ -350,23 +492,34 @@ for ticker in TICKERS:
                     )
                 else:
                     st.info("Keine Trades vorhanden.")
+
+            # LIVE: MOC-Modus Vorschau (ohne historischen Backtest)
+            if exec_mode.startswith("Market-On-Close"):
+                live_prob = float(feat["SignalProb"].iloc[-1])
+                st.subheader("🕒 MOC Live-Vorschau")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Heutige P(Signal)", f"{live_prob:.4f}")
+                c2.metric("Entry-Threshold", f"{ENTRY_PROB:.2f}")
+                c3.metric("Exit-Threshold", f"{EXIT_PROB:.2f}")
+
+                if live_prob > ENTRY_PROB:
+                    st.success("📥 Würde heute eine **MOC-Entry-Order** einreichen (Ausführung zum offiziellen Close).")
+                elif live_prob < EXIT_PROB:
+                    st.warning("📤 Würde heute eine **MOC-Exit-Order** einreichen (Ausführung zum offiziellen Close).")
+                else:
+                    st.info("⏳ Keine MOC-Order heute (zwischen Entry- und Exit-Schwelle).")
+
+                st.caption("Hinweis: Für echten MOC-Backtest wären historische Intraday-Daten notwendig. "
+                           "Die obigen Kennzahlen stammen aus dem robusten 'Next Open'-Backtest.")
+
         except Exception as e:
             st.error(f"Fehler bei {ticker}: {e}")
 
-
 # ─────────────────────────────────────────────────────────────
-# Zusammenfassung
+# Zusammenfassung (Next Open Backtest)
 # ─────────────────────────────────────────────────────────────
 if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
-    bh_true_returns = {}
-    for ticker in TICKERS:
-        df_full = download_data(ticker, START_DATE.strftime("%Y-%m-%d"), END_DATE.strftime("%Y-%m-%d"))
-        if len(df_full) > 1:
-            bh_ret_full = (df_full["Close"].iloc[-1] / df_full["Close"].iloc[0] - 1) * 100
-            bh_true_returns[ticker] = bh_ret_full
-        else:
-            bh_true_returns[ticker] = np.nan
     summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
 
     total_net_pnl = summary_df["Net P&L (€)"].sum()
@@ -377,9 +530,9 @@ if results:
     total_net_return_pct = total_net_pnl / total_capital * 100
     total_gross_return_pct = total_gross_pnl / total_capital * 100
 
-    st.subheader("📊 Summary of all Tickers")
+    st.subheader("📊 Summary of all Tickers (Next Open Backtest)")
     cols = st.columns(4)
-    cols[0].metric("Cumulative Net P&LL (€)", f"{total_net_pnl:,.2f}")
+    cols[0].metric("Cumulative Net P&L (€)", f"{total_net_pnl:,.2f}")
     cols[1].metric("Cumulative Trading Costs (€)", f"{total_fees:,.2f}")
     cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
     cols[3].metric("Total Number of Trades", f"{int(total_trades)}")
@@ -389,10 +542,7 @@ if results:
     )
 
     def color_phase_html(val):
-        colors = {
-            "Open": "#d0ebff",
-            "Flat": "#f0f0f0"
-        }
+        colors = {"Open": "#d0ebff", "Flat": "#f0f0f0"}
         bg = colors.get(val, "#ffffff")
         return f"background-color: {bg};"
 
@@ -410,12 +560,9 @@ if results:
             "Net P&L (%)": "{:.2f}",
             "Net P&L (€)": "{:.2f}"
         })
-        .applymap(
-            lambda v: "font-weight: bold;" if isinstance(v, (int, float)) else "",
-            subset=pd.IndexSlice[:, ["Sharpe-Ratio"]],
-        )
+        .applymap(lambda v: "font-weight: bold;" if isinstance(v, (int, float)) else "", subset=pd.IndexSlice[:, ["Sharpe-Ratio"]])
         .applymap(color_phase_html, subset=["Phase"])
-        .set_caption("Strategy-Performance per Ticker")
+        .set_caption("Strategy-Performance per Ticker (Next Open Execution)")
     )
     show_styled_or_plain(summary_df, styled)
     st.download_button(
@@ -425,25 +572,22 @@ if results:
         mime="text/csv"
     )
 
-    # Offene Positionen
+    # Offene Positionen (auf Basis Next Open Backtest)
     open_positions = []
     for ticker, trades in all_trades.items():
         if trades and trades[-1]["Typ"] == "Entry":
             last_entry = next(t for t in reversed(trades) if t["Typ"] == "Entry")
-            prob = all_dfs[ticker]["SignalProb"].iloc[-1]
+            prob = all_feat[ticker]["SignalProb"].iloc[-1]
             open_positions.append({
                 "Ticker": ticker,
-                "Entry Date": last_entry["Date"].strftime("%Y-%m-%d"),
+                "Entry Date": pd.to_datetime(last_entry["Date"]).strftime("%Y-%m-%d"),
                 "Entry Price": round(last_entry["Price"], 2),
-                "Current Prob.": round(prob, 4),
+                "Current Prob.": round(float(prob), 4),
             })
-    st.subheader("📋 Open Positions")
+    st.subheader("📋 Open Positions (Next Open Backtest)")
     if open_positions:
         open_df = pd.DataFrame(open_positions)
-        styled_open = open_df.style.format({
-            "Entry Price": "{:.2f}",
-            "Current Prob.": "{:.4f}"
-        })
+        styled_open = open_df.style.format({"Entry Price": "{:.2f}", "Current Prob.": "{:.4f}"})
         show_styled_or_plain(open_df, styled_open)
         st.download_button(
             "Offene Positionen als CSV",
@@ -455,11 +599,3 @@ if results:
         st.success("Keine offenen Positionen.")
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Stelle sicher, dass mindestens ein Ticker korrekt eingegeben ist und genügend Daten vorhanden sind.")
-
-
-
-
-
-
-
-
