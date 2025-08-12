@@ -20,6 +20,9 @@ from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import plotly.express as px
 
+# Neu: für CSV-Vorlagen
+import os, glob, io
+
 # ─────────────────────────────────────────────────────────────
 # Config / Globals
 # ─────────────────────────────────────────────────────────────
@@ -27,12 +30,201 @@ st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 
 # ─────────────────────────────────────────────────────────────
+# Helper – Tickerlisten / CSV / Vorlagen
+# ─────────────────────────────────────────────────────────────
+def _normalize_tickers(items: List[str]) -> List[str]:
+    """Trim + upper + dedupe, erhalte Reihenfolge."""
+    cleaned = []
+    for x in items or []:
+        if not isinstance(x, str):
+            continue
+        s = x.strip().upper()
+        if s:
+            cleaned.append(s)
+    # Deduplizieren bei Erhalt der Reihenfolge
+    return list(dict.fromkeys(cleaned))
+
+def parse_ticker_csv(path_or_buffer) -> List[str]:
+    """
+    CSV mit Spalte 'ticker'/'Ticker'/'symbol' oder erste Nicht-Empty-Spalte.
+    Akzeptiert Pfad ODER Upload-Buffer.
+    """
+    try:
+        df = pd.read_csv(path_or_buffer)
+    except Exception:
+        # Fallback: evtl. Semikolon
+        df = pd.read_csv(path_or_buffer, sep=";")
+    if df.empty:
+        return []
+    cols_lower = {c.lower(): c for c in df.columns}
+    for key in ("ticker", "symbol", "symbols", "isin", "code"):
+        if key in cols_lower:
+            col = cols_lower[key]
+            return _normalize_tickers(df[col].astype(str).tolist())
+    # sonst erste Spalte nehmen
+    first = df.columns[0]
+    return _normalize_tickers(df[first].astype(str).tolist())
+
+def discover_builtin_lists(folder: str = "lists") -> Dict[str, str]:
+    """
+    Rekursiv *.csv in ./lists finden.
+    Rückgabe: {anzeigename: pfad}  (anzeigename ohne .csv, z.B. 'US/sp500')
+    """
+    result = {}
+    try:
+        for p in glob.glob(os.path.join(folder, "**", "*.csv"), recursive=True):
+            rel = os.path.relpath(p, folder)
+            name = os.path.splitext(rel)[0].replace("\\", "/")
+            result[name] = p
+    except Exception:
+        pass
+    return result
+
+def get_embedded_lists() -> Dict[str, List[str]]:
+    """
+    Eingebettete (im Code hinterlegte) Vorlagen – optional.
+    Du kannst die Listen unten jederzeit erweitern.
+    """
+    return {
+        "DE/DAX40 (Auszug)": _normalize_tickers([
+            "ALV.DE","BAS.DE","BAYN.DE","BEI.DE","BMW.DE","CBK.DE","CON.DE","DHL.DE",
+            "DPW.DE","DTG.DE","HEI.DE","HEN3.DE","IFX.DE","LIN.DE","MRK.DE","MUV2.DE",
+            "PAH3.DE","P911.DE","RWE.DE","SAP.DE","SIE.DE","VNA.DE","VOW3.DE"
+        ]),
+        "US/Nasdaq100 (Auszug)": _normalize_tickers([
+            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","TSLA","COST",
+            "ADBE","NFLX","AMD","INTC","QCOM","PDD"
+        ]),
+        "US/S&P500 (Auszug)": _normalize_tickers([
+            "AAPL","MSFT","AMZN","META","GOOGL","BRK-B","NVDA","JPM","XOM","UNH","V","HD","PG","MA"
+        ]),
+        "AT/ATX (Auszug)": _normalize_tickers([
+            "EBS.VI","OMV.VI","VER.VI","VOE.VI","RBI.VI","ANDR.VI","DO&CO.VI","SBO.VI"
+        ]),
+        "HK/HangSeng (Auszug)": _normalize_tickers([
+            "0700.HK","1299.HK","0939.HK","2318.HK","1398.HK","0005.HK","0388.HK"
+        ]),
+    }
+
+# ─────────────────────────────────────────────────────────────
 # Sidebar / Parameter
 # ─────────────────────────────────────────────────────────────
 st.sidebar.header("Parameter")
-tickers_input = st.sidebar.text_input("Tickers (Comma-separated)", value="BABA, RQ0.F, VOW3.DE, INTC, BIDU, 0700.HK, LUMN, 2318.HK")
-TICKERS = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
+# Neu: Quelle für Ticker wählen
+ticker_source = st.sidebar.selectbox(
+    "Ticker-Quelle",
+    ["Manuell (Textfeld)", "CSV-Upload", "Vordefiniert (aus ./lists)"],
+    index=0
+)
+
+tickers_final: List[str] = []
+
+if ticker_source == "Manuell (Textfeld)":
+    tickers_input = st.sidebar.text_input(
+        "Tickers (Komma-getrennt)",
+        value="BABA, RQ0.F, VOW3.DE, INTC, BIDU, 0700.HK, LUMN, 2318.HK"
+    )
+    tickers_final = _normalize_tickers([t for t in tickers_input.split(",") if t.strip()])
+
+elif ticker_source == "CSV-Upload":
+    st.sidebar.caption("Lade eine oder mehrere CSVs mit Spalte **ticker** (oder erste Spalte).")
+    uploads = st.sidebar.file_uploader("CSV-Dateien", type=["csv"], accept_multiple_files=True)
+    collected = []
+    if uploads:
+        for up in uploads:
+            try:
+                collected += parse_ticker_csv(up)
+            except Exception as e:
+                st.sidebar.error(f"Fehler beim Lesen von '{up.name}': {e}")
+    tickers_final = _normalize_tickers(collected)
+
+    if tickers_final:
+        st.sidebar.caption(f"Gefundene Ticker: {len(tickers_final)}")
+        # Option zum Mischen & Begrenzen
+        shuffle_lists = st.sidebar.checkbox("Zufällig mischen", value=False, help="Reihenfolge zufällig (seed=42)")
+        if shuffle_lists:
+            import random
+            random.seed(42); random.shuffle(tickers_final)
+        max_n = st.sidebar.number_input("Max. Anzahl (0 = alle)", min_value=0, max_value=len(tickers_final),
+                                        value=0, step=10)
+        if max_n and max_n < len(tickers_final):
+            tickers_final = tickers_final[:int(max_n)]
+        # Feintuning
+        tickers_final = st.sidebar.multiselect("Auswahl verfeinern", options=tickers_final, default=tickers_final)
+
+elif ticker_source == "Vordefiniert (aus ./lists)":
+    builtins_files = discover_builtin_lists("lists")  # ./lists rekursiv
+    embedded = get_embedded_lists()                  # im Code hinterlegt
+
+    tabs = st.sidebar.tabs(["Aus Ordner ./lists", "Eingebettet (im Code)"])
+    combined = []
+
+    with tabs[0]:
+        if not builtins_files:
+            st.warning("Keine CSVs in ./lists gefunden. Lege Dateien dort ab (rekursiv möglich).")
+        else:
+            choices = st.multiselect(
+                "Listen wählen (mehrfach möglich)",
+                options=sorted(builtins_files.keys()),
+                help="Mehrere Templates kombinieren – Ticker werden dedupliziert."
+            )
+            if choices:
+                for name in choices:
+                    path = builtins_files[name]
+                    try:
+                        combined += parse_ticker_csv(path)
+                    except Exception as e:
+                        st.error(f"Fehler in Liste '{name}': {e}")
+
+    with tabs[1]:
+        if embedded:
+            emb_choices = st.multiselect(
+                "Eingebettete Listen wählen",
+                options=sorted(embedded.keys()),
+                help="Im Code mitgelieferte Auszüge, jederzeit erweiterbar."
+            )
+            for nm in emb_choices:
+                combined += (embedded.get(nm) or [])
+
+    tickers_final = _normalize_tickers(combined)
+
+    if tickers_final:
+        st.sidebar.caption(f"Gefundene Ticker (vereint & dedupliziert): {len(tickers_final)}")
+
+        shuffle_lists = st.sidebar.checkbox("Zufällig mischen", value=False, key="shuffle_builtins")
+        if shuffle_lists:
+            import random
+            random.seed(42); random.shuffle(tickers_final)
+
+        max_n = st.sidebar.number_input("Max. Anzahl (0 = alle)", min_value=0, max_value=len(tickers_final),
+                                        value=min(50, len(tickers_final)), step=10, key="maxn_builtins")
+        if max_n and max_n < len(tickers_final):
+            tickers_final = tickers_final[:int(max_n)]
+
+        tickers_final = st.sidebar.multiselect("Tickers aus den gewählten Listen", options=tickers_final, default=tickers_final)
+
+        with st.sidebar.expander("Vorschau (erste 30)"):
+            st.write(tickers_final[:30])
+
+        st.sidebar.download_button(
+            "Kombinierte Liste als CSV",
+            pd.DataFrame({"ticker": tickers_final}).to_csv(index=False).encode("utf-8"),
+            file_name="tickers_combined.csv", mime="text/csv"
+        )
+    else:
+        st.sidebar.info("Noch keine Ticker ausgewählt/gefunden.")
+
+# Falls leer gelassen wurde: Fallback auf kleines Beispiel
+if not tickers_final:
+    tickers_final = _normalize_tickers(["BABA","VOW3.DE","INTC","ALV.DE","AAPL"])
+
+# Endgültige Tickerliste
+TICKERS = tickers_final
+
+# ─────────────────────────────────────────────────────────────
+# Weitere Parameter
+# ─────────────────────────────────────────────────────────────
 START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2024-01-01"))
 END_DATE   = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.now(LOCAL_TZ).date()))
 
@@ -78,7 +270,7 @@ max_depth     = st.sidebar.number_input("max_depth",     min_value=1, max_value=
 MODEL_PARAMS = dict(n_estimators=int(n_estimators), learning_rate=float(learning_rate), max_depth=int(max_depth), random_state=42)
 
 # ─────────────────────────────────────────────────────────────
-# Helper
+# Helper (bestehend)
 # ─────────────────────────────────────────────────────────────
 def show_styled_or_plain(df: pd.DataFrame, styler):
     try:
@@ -721,17 +913,15 @@ if results:
         st.success("Keine offenen Positionen.")
 
     # ─────────────────────────────────────────────────────────
-    # Round-Trips (Entry → Exit) – mit Filter
+    # Round-Trips (Entry → Exit) – mit Filter + Histogramme
     # ─────────────────────────────────────────────────────────
     rt_df = compute_round_trips(all_trades)
 
     if not rt_df.empty:
         st.subheader("🔁 Abgeschlossene Trades (Round-Trips) – Filter")
 
-        # Basiswerte/Defaults robust bestimmen
         rt_df["Entry Date"] = pd.to_datetime(rt_df["Entry Date"])
         rt_df["Exit Date"]  = pd.to_datetime(rt_df["Exit Date"])
-        # Safety: fehlende Spalten auffüllen
         for c in ["Entry Prob","Exit Prob","Return (%)","PnL Net (€)","Fees (€)","Hold (days)"]:
             if c not in rt_df.columns:
                 rt_df[c] = np.nan
@@ -739,17 +929,13 @@ if results:
         r_min_d, r_max_d = rt_df["Entry Date"].min().date(), rt_df["Entry Date"].max().date()
         r_ticks = sorted(rt_df["Ticker"].unique().tolist())
 
-        # Bereiche für Slider sicher bestimmen (mit sinnvollen Defaults)
         def finite_minmax(series, fallback=(0.0, 1.0)):
             s = pd.to_numeric(series, errors="coerce")
             lo, hi = float(np.nanmin(s.values)), float(np.nanmax(s.values))
-            if not np.isfinite(lo) or not np.isfinite(hi):
-                lo, hi = fallback
-            if lo == hi:
+            if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
                 lo, hi = fallback
             return lo, hi
 
-        # UI-Filter
         r1, r2, r3 = st.columns([1.1, 1.1, 1.5])
         with r1:
             rt_tick_sel = st.multiselect("Ticker (Round-Trips)", options=r_ticks, default=r_ticks)
@@ -777,7 +963,6 @@ if results:
 
         rds, rde = (rt_date if isinstance(rt_date, tuple) else (r_min_d, r_max_d))
 
-        # Mask anwenden
         mask_rt = (
             rt_df["Ticker"].isin(rt_tick_sel) &
             (rt_df["Entry Date"].dt.date.between(rds, rde)) &
@@ -789,12 +974,9 @@ if results:
         )
 
         rt_f = rt_df.loc[mask_rt].copy()
-        # Anzeige aufbereiten
         rt_f_disp = rt_f.copy()
         rt_f_disp["Entry Date"] = rt_f_disp["Entry Date"].dt.strftime("%Y-%m-%d")
         rt_f_disp["Exit Date"]  = rt_f_disp["Exit Date"].dt.strftime("%Y-%m-%d")
-
-        # Integer-Format für Haltedauer ohne Komma
         if "Hold (days)" in rt_f_disp.columns:
             rt_f_disp["Hold (days)"] = rt_f_disp["Hold (days)"].round().astype("Int64")
 
@@ -811,78 +993,51 @@ if results:
             rt_f_disp.to_csv(index=False).encode("utf-8"),
             file_name="round_trips_filtered.csv", mime="text/csv"
         )
-        
+
         # 📊 Verteilung der Round-Trip-Ergebnisse (gefiltert)
         st.markdown("### 📊 Verteilung der Round-Trip-Ergebnisse")
-        
         bins = st.slider("Anzahl Bins", min_value=10, max_value=100, value=30, step=5, key="rt_bins")
-        
-        # Nimm die aktuell gefilterten Round-Trips (rt_f_disp existiert bereits oben).
-        # Wir nutzen hier rt_f (unformatierte Daten) für die Berechnung:
+
         ret = pd.to_numeric(rt_f.get("Return (%)"), errors="coerce").dropna()
         pnl = pd.to_numeric(rt_f.get("PnL Net (€)"), errors="coerce").dropna()
-        
-        # Schnell-Stats
+
         def pct(x): 
             return f"{x:.2f}%"
-        def eur(x):
-            return f"{x:,.2f}€"
-        
         cstats = st.columns(5)
         cstats[0].metric("Anzahl", f"{len(ret)}")
         cstats[1].metric("Winrate", pct(100.0 * (ret > 0).mean()) if len(ret) else "–")
         cstats[2].metric("Ø Return", pct(ret.mean()) if len(ret) else "–")
         cstats[3].metric("Median",  pct(ret.median()) if len(ret) else "–")
         cstats[4].metric("Std-Abw.", pct(ret.std()) if len(ret) else "–")
-        
+
         col_h1, col_h2 = st.columns(2)
-        
         with col_h1:
             if ret.empty:
                 st.info("Keine Rendite-Werte vorhanden (Filter enger gestellt oder keine abgeschlossenen Trades).")
             else:
-                fig_ret = go.Figure(
-                    go.Histogram(
-                        x=ret,
-                        nbinsx=bins,
-                        marker_line_width=0
-                    )
-                )
+                fig_ret = go.Figure(go.Histogram(x=ret, nbinsx=bins, marker_line_width=0))
                 fig_ret.add_vline(x=0, line_dash="dash", opacity=0.5)
                 fig_ret.add_vline(x=float(ret.mean()), line_dash="dot", opacity=0.9)
                 fig_ret.update_layout(
                     title="Histogramm: Return (%)",
-                    xaxis_title="Return (%)",
-                    yaxis_title="Häufigkeit",
-                    height=360,
-                    margin=dict(t=40, l=40, r=20, b=40),
-                    showlegend=False
+                    xaxis_title="Return (%)", yaxis_title="Häufigkeit",
+                    height=360, margin=dict(t=40, l=40, r=20, b=40), showlegend=False
                 )
                 st.plotly_chart(fig_ret, use_container_width=True)
-        
         with col_h2:
             if pnl.empty:
                 st.info("Keine PnL-Werte vorhanden.")
             else:
-                fig_pnl = go.Figure(
-                    go.Histogram(
-                        x=pnl,
-                        nbinsx=bins,
-                        marker_line_width=0
-                    )
-                )
+                fig_pnl = go.Figure(go.Histogram(x=pnl, nbinsx=bins, marker_line_width=0))
                 fig_pnl.add_vline(x=0, line_dash="dash", opacity=0.5)
                 fig_pnl.add_vline(x=float(pnl.mean()), line_dash="dot", opacity=0.9)
                 fig_pnl.update_layout(
                     title="Histogramm: PnL Net (€)",
-                    xaxis_title="PnL Net (€)",
-                    yaxis_title="Häufigkeit",
-                    height=360,
-                    margin=dict(t=40, l=40, r=20, b=40),
-                    showlegend=False
+                    xaxis_title="PnL Net (€)", yaxis_title="Häufigkeit",
+                    height=360, margin=dict(t=40, l=40, r=20, b=40), showlegend=False
                 )
                 st.plotly_chart(fig_pnl, use_container_width=True)
-    
+
     else:
         st.info("Noch keine abgeschlossenen Round-Trips vorhanden.")
 else:
