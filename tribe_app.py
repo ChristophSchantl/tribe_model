@@ -989,6 +989,75 @@ if results:
                 )
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
+        # ─────────────────────────────────────────────────────────
+        # Portfolio-Korrelation (Heatmap) – nach den Histogrammen
+        # ─────────────────────────────────────────────────────────
+        st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
+        
+        if len(all_dfs) >= 2:
+            # Preise der ausgewählten Ticker zu einer Matrix zusammenbauen
+            price_cols = {}
+            for tk, df_bt in all_dfs.items():
+                if "Close" in df_bt.columns:
+                    s = df_bt["Close"].rename(tk).astype(float)
+                    s = s.loc[str(START_DATE):str(END_DATE)]
+                    price_cols[tk] = s
+        
+            if price_cols:
+                prices = pd.concat(price_cols.values(), axis=1, join="inner")
+                prices = prices.dropna(how="any")
+        
+                c1, c2 = st.columns(2)
+                with c1:
+                    freq_label = st.selectbox("Return-Frequenz",
+                                              options=["täglich", "wöchentlich", "monatlich"],
+                                              index=0, key="corr_freq")
+                with c2:
+                    method_label = st.selectbox("Korrelationsmethode",
+                                                options=["Pearson", "Spearman"],
+                                                index=0, key="corr_method")
+        
+                freq_map = {"täglich": "D", "wöchentlich": "W-FRI", "monatlich": "M"}
+                prices_rs = prices.resample(freq_map[freq_label]).last()
+        
+                rets = prices_rs.pct_change().dropna(how="any")
+                if rets.shape[0] >= 5 and rets.shape[1] >= 2:
+                    corr = rets.corr(method=method_label.lower())
+        
+                    # Reihenfolge wie in TICKERS halten (nur vorhandene Spalten)
+                    ordered_cols = [tk for tk in TICKERS if tk in corr.columns]
+                    corr = corr.loc[ordered_cols, ordered_cols]
+        
+                    fig_corr = px.imshow(
+                        corr.round(2),
+                        text_auto=True,                    # Zahlen in den Kästchen
+                        color_continuous_scale="RdBu_r",
+                        zmin=-1, zmax=1,
+                        aspect="auto",
+                        labels=dict(color="ρ")
+                    )
+                    fig_corr.update_layout(
+                        title="Korrelation der Close-Returns",
+                        height=520,
+                        margin=dict(t=50, b=30, l=40, r=20)
+                    )
+                    st.plotly_chart(fig_corr, use_container_width=True)
+        
+                    st.download_button(
+                        "Korrelationsmatrix als CSV",
+                        corr.to_csv().encode("utf-8"),
+                        file_name="correlation_matrix.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.info("Zu wenige Datenüberschneidungen für eine Korrelationsmatrix.")
+            else:
+                st.info("Keine Preisdaten gefunden.")
+        else:
+            st.info("Mindestens zwei Ticker nötig, um Korrelationen zu berechnen.")
+
+
+    
     else:
         st.info("Noch keine abgeschlossenen Round-Trips vorhanden.")
 else:
