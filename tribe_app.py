@@ -811,6 +811,78 @@ if results:
             rt_f_disp.to_csv(index=False).encode("utf-8"),
             file_name="round_trips_filtered.csv", mime="text/csv"
         )
+        
+        # 📊 Verteilung der Round-Trip-Ergebnisse (gefiltert)
+        st.markdown("### 📊 Verteilung der Round-Trip-Ergebnisse")
+        
+        bins = st.slider("Anzahl Bins", min_value=10, max_value=100, value=30, step=5, key="rt_bins")
+        
+        # Nimm die aktuell gefilterten Round-Trips (rt_f_disp existiert bereits oben).
+        # Wir nutzen hier rt_f (unformatierte Daten) für die Berechnung:
+        ret = pd.to_numeric(rt_f.get("Return (%)"), errors="coerce").dropna()
+        pnl = pd.to_numeric(rt_f.get("PnL Net (€)"), errors="coerce").dropna()
+        
+        # Schnell-Stats
+        def pct(x): 
+            return f"{x:.2f}%"
+        def eur(x):
+            return f"{x:,.2f}€"
+        
+        cstats = st.columns(5)
+        cstats[0].metric("Anzahl", f"{len(ret)}")
+        cstats[1].metric("Winrate", pct(100.0 * (ret > 0).mean()) if len(ret) else "–")
+        cstats[2].metric("Ø Return", pct(ret.mean()) if len(ret) else "–")
+        cstats[3].metric("Median",  pct(ret.median()) if len(ret) else "–")
+        cstats[4].metric("Std-Abw.", pct(ret.std()) if len(ret) else "–")
+        
+        col_h1, col_h2 = st.columns(2)
+        
+        with col_h1:
+            if ret.empty:
+                st.info("Keine Rendite-Werte vorhanden (Filter enger gestellt oder keine abgeschlossenen Trades).")
+            else:
+                fig_ret = go.Figure(
+                    go.Histogram(
+                        x=ret,
+                        nbinsx=bins,
+                        marker_line_width=0
+                    )
+                )
+                fig_ret.add_vline(x=0, line_dash="dash", opacity=0.5)
+                fig_ret.add_vline(x=float(ret.mean()), line_dash="dot", opacity=0.9)
+                fig_ret.update_layout(
+                    title="Histogramm: Return (%)",
+                    xaxis_title="Return (%)",
+                    yaxis_title="Häufigkeit",
+                    height=360,
+                    margin=dict(t=40, l=40, r=20, b=40),
+                    showlegend=False
+                )
+                st.plotly_chart(fig_ret, use_container_width=True)
+        
+        with col_h2:
+            if pnl.empty:
+                st.info("Keine PnL-Werte vorhanden.")
+            else:
+                fig_pnl = go.Figure(
+                    go.Histogram(
+                        x=pnl,
+                        nbinsx=bins,
+                        marker_line_width=0
+                    )
+                )
+                fig_pnl.add_vline(x=0, line_dash="dash", opacity=0.5)
+                fig_pnl.add_vline(x=float(pnl.mean()), line_dash="dot", opacity=0.9)
+                fig_pnl.update_layout(
+                    title="Histogramm: PnL Net (€)",
+                    xaxis_title="PnL Net (€)",
+                    yaxis_title="Häufigkeit",
+                    height=360,
+                    margin=dict(t=40, l=40, r=20, b=40),
+                    showlegend=False
+                )
+                st.plotly_chart(fig_pnl, use_container_width=True)
+    
     else:
         st.info("Noch keine abgeschlossenen Round-Trips vorhanden.")
 else:
