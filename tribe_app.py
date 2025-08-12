@@ -642,11 +642,11 @@ if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
     summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
 
-    total_net_pnl  = summary_df["Net P&L (€)"].sum()
-    total_fees     = summary_df["Fees (€)"].sum()
+    total_net_pnl   = summary_df["Net P&L (€)"].sum()
+    total_fees      = summary_df["Fees (€)"].sum()
     total_gross_pnl = total_net_pnl + total_fees
-    total_trades   = summary_df["Number of Trades"].sum()
-    total_capital  = INIT_CAP * len(summary_df)
+    total_trades    = summary_df["Number of Trades"].sum()
+    total_capital   = INIT_CAP * len(summary_df)
     total_net_return_pct   = total_net_pnl / total_capital * 100
     total_gross_return_pct = total_gross_pnl / total_capital * 100
 
@@ -657,14 +657,11 @@ if results:
     cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
     cols[3].metric("Total Number of Trades",   f"{int(total_trades)}")
 
-    # Gesamtperformance (%)
-    total_strategy_net_pct   = total_net_return_pct
-    total_strategy_gross_pct = total_gross_return_pct
+    # Gesamt-Performance (%)
     bh_total_pct = float(summary_df["Buy & Hold Net (%)"].dropna().mean()) if "Buy & Hold Net (%)" in summary_df.columns else float("nan")
-
     cols_pct = st.columns(3)
-    cols_pct[0].metric("Strategy Net (%) – total",   f"{total_strategy_net_pct:.2f}")
-    cols_pct[1].metric("Strategy Gross (%) – total", f"{total_strategy_gross_pct:.2f}")
+    cols_pct[0].metric("Strategy Net (%) – total",   f"{total_net_return_pct:.2f}")
+    cols_pct[1].metric("Strategy Gross (%) – total", f"{total_gross_return_pct:.2f}")
     cols_pct[2].metric("Buy & Hold Net (%) – total", f"{bh_total_pct:.2f}")
 
     def color_phase_html(val):
@@ -675,13 +672,18 @@ if results:
     styled = (
         summary_df.style
         .format({
-            "Strategy Net (%)":"{:.2f}","Strategy Gross (%)":"{:.2f}",
-            "Buy & Hold Net (%)":"{:.2f}","Volatility (%)":"{:.2f}",
-            "Sharpe-Ratio":"{:.2f}","Max Drawdown (%)":"{:.2f}",
-            "Calmar-Ratio":"{:.2f}","Fees (€)":"{:.2f}",
-            "Net P&L (%)":"{:.2f}","Net P&L (€)":"{:.2f}"
+            "Strategy Net (%)":"{:.2f}",
+            "Strategy Gross (%)":"{:.2f}",
+            "Buy & Hold Net (%)":"{:.2f}",
+            "Volatility (%)":"{:.2f}",
+            "Sharpe-Ratio":"{:.2f}",
+            "Max Drawdown (%)":"{:.2f}",
+            "Calmar-Ratio":"{:.2f}",
+            "Fees (€)":"{:.2f}",
+            "Net P&L (%)":"{:.2f}",
+            "Net P&L (€)":"{:.2f}",
         })
-        .applymap(lambda v: "font-weight: bold;" if isinstance(v,(int,float)) else "", subset=pd.IndexSlice[:,["Sharpe-Ratio"]])
+        .applymap(lambda v: "font-weight: bold;" if isinstance(v, (int, float)) else "", subset=pd.IndexSlice[:, ["Sharpe-Ratio"]])
         .applymap(color_phase_html, subset=["Phase"])
         .set_caption("Strategy-Performance per Ticker (Next Open Execution)")
     )
@@ -689,74 +691,155 @@ if results:
     st.download_button(
         "Summary als CSV herunterladen",
         summary_df.reset_index().to_csv(index=False).encode("utf-8"),
-        file_name="strategy_summary.csv", mime="text/csv"
+        file_name="strategy_summary.csv",
+        mime="text/csv"
     )
 
-    # Open Positions
+    # ─────────────────────────────────────────────────────────
+    # Offene Positionen
+    # ─────────────────────────────────────────────────────────
     st.subheader("📋 Open Positions (Next Open Backtest)")
     open_positions = []
     for ticker, trades in all_trades.items():
-        if trades and trades[-1]["Typ"]=="Entry":
-            last_entry = next(t for t in reversed(trades) if t["Typ"]=="Entry")
+        if trades and trades[-1]["Typ"] == "Entry":
+            last_entry = next(t for t in reversed(trades) if t["Typ"] == "Entry")
             prob = all_feat[ticker]["SignalProb"].iloc[-1]
             entry_ts = pd.to_datetime(last_entry["Date"])
             open_positions.append({
-                "Ticker": ticker, "Name": get_ticker_name(ticker),
-                "Entry Date": entry_ts, "Entry Price": round(last_entry["Price"],2),
-                "Current Prob.": round(float(prob),4),
+                "Ticker": ticker,
+                "Name": get_ticker_name(ticker),
+                "Entry Date": entry_ts,
+                "Entry Price": round(last_entry["Price"], 2),
+                "Current Prob.": round(float(prob), 4),
             })
+
     if open_positions:
         open_df = pd.DataFrame(open_positions).sort_values("Entry Date", ascending=False)
-        open_df_display = open_df.copy(); open_df_display["Entry Date"] = open_df_display["Entry Date"].dt.strftime("%Y-%m-%d")
-        styled_open = open_df_display.style.format({"Entry Price":"{:.2f}","Current Prob.":"{:.4f}"})
+        open_df_display = open_df.copy()
+        open_df_display["Entry Date"] = open_df_display["Entry Date"].dt.strftime("%Y-%m-%d")
+        styled_open = open_df_display.style.format({"Entry Price": "{:.2f}", "Current Prob.": "{:.4f}"})
         show_styled_or_plain(open_df_display, styled_open)
-        st.download_button("Offene Positionen als CSV", open_df.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8"),
-                           file_name="open_positions.csv", mime="text/csv")
+        st.download_button(
+            "Offene Positionen als CSV",
+            open_df.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8"),
+            file_name="open_positions.csv",
+            mime="text/csv"
+        )
     else:
         st.success("Keine offenen Positionen.")
 
-        # Round-Trips
-        rt_df = compute_round_trips(all_trades)
-        if not rt_df.empty:
-            st.subheader("🔁 Abgeschlossene Trades (Round-Trips) – Filter")
-            r_min_d, r_max_d = rt_df["Entry Date"].min().date(), rt_df["Exit Date"].max().date()
-            r_ticks = sorted(rt_df["Ticker"].unique().tolist())
-            r1, r2, r3 = st.columns([1.2, 1.2, 1.6])
-            with r1:
-                rt_tick_sel = st.multiselect("Ticker (Round-Trips)", options=r_ticks, default=r_ticks)
-            with r2:
-                rt_date = st.date_input("Zeitraum (Entry-Datum)", value=(r_min_d, r_max_d), min_value=r_min_d, max_value=r_max_d, key="rt_date")
-            with r3:
-                hd_min, hd_max = int(rt_df["Hold (days)"].min()), int(rt_df["Hold (days)"].max())
-                rt_hold = st.slider("Haltedauer", min_value=int(hd_min), max_value=int(hd_max),
-                                    value=(int(hd_min), int(hd_max)), step=1, key="rt_hold")
+    # ─────────────────────────────────────────────────────────
+    # Events-Filter (optional ausblendbar)
+    # ─────────────────────────────────────────────────────────
+    SHOW_EVENTS_FILTER = False  # ← auf True setzen, um den Events-Filter wieder zu zeigen
 
-            rds, rde = (rt_date if isinstance(rt_date, tuple) else (r_min_d, r_max_d))
-            rt_mask = (
-                rt_df["Ticker"].isin(rt_tick_sel) &
-                (rt_df["Entry Date"].dt.date.between(rds, rde)) &
-                (rt_df["Hold (days)"].between(rt_hold[0], rt_hold[1]))
+    if SHOW_EVENTS_FILTER:
+        combined = []
+        for tk, tr in all_trades.items():
+            tk_name = get_ticker_name(tk)
+            for row in tr:
+                r = dict(row)
+                r["Ticker"] = tk
+                r["Name"] = tk_name
+                r["Date"] = pd.to_datetime(r["Date"])
+                combined.append(r)
+
+        if combined:
+            st.subheader("📒 Alle Trades (Events) – Filter")
+            comb_df = pd.DataFrame(combined)
+            if "Prob" not in comb_df.columns:
+                comb_df["Prob"] = np.nan
+            if "HoldDays" not in comb_df.columns:
+                comb_df["HoldDays"] = np.nan
+
+            min_d, max_d = comb_df["Date"].min().date(), comb_df["Date"].max().date()
+            tickers_avail = sorted(comb_df["Ticker"].unique().tolist())
+
+            f1, f2, f3 = st.columns([1.2, 1.2, 1.6])
+            with f1:
+                type_sel = st.multiselect("Typ", options=["Entry", "Exit"], default=["Entry", "Exit"])
+                tick_sel = st.multiselect("Ticker", options=tickers_avail, default=tickers_avail)
+            with f2:
+                date_range = st.date_input("Zeitraum", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+                prob_min = float(np.nanmin(comb_df["Prob"].values))
+                prob_max = float(np.nanmax(comb_df["Prob"].values))
+                if not np.isfinite(prob_min):
+                    prob_min = 0.0
+                if not np.isfinite(prob_max):
+                    prob_max = 1.0
+                prob_sel = st.slider("Signal-Wahrscheinlichkeit", min_value=0.0, max_value=1.0,
+                                     value=(max(0.0, prob_min), min(1.0, prob_max)), step=0.01)
+            with f3:
+                hd_series = comb_df.loc[comb_df["Typ"] == "Exit", "HoldDays"].dropna()
+                if len(hd_series):
+                    hd_min, hd_max = int(hd_series.min()), int(hd_series.max())
+                else:
+                    hd_min, hd_max = 0, 60
+                hold_sel = st.slider("Haltedauer (nur Exit-Events)", min_value=int(hd_min), max_value=int(hd_max),
+                                     value=(int(hd_min), int(hd_max)), step=1)
+
+            d_start, d_end = (date_range if isinstance(date_range, tuple) else (min_d, max_d))
+            mask = (
+                comb_df["Typ"].isin(type_sel)
+                & comb_df["Ticker"].isin(tick_sel)
+                & (comb_df["Date"].dt.date.between(d_start, d_end))
+                & (comb_df["Prob"].fillna(0.0).between(prob_sel[0], prob_sel[1]))
             )
-            rt_f = rt_df.loc[rt_mask].copy()
-            rt_disp = rt_f.copy()
-            rt_disp["Entry Date"] = rt_disp["Entry Date"].dt.strftime("%Y-%m-%d")
-            rt_disp["Exit Date"]  = rt_disp["Exit Date"].dt.strftime("%Y-%m-%d")
+            mask &= np.where(
+                comb_df["Typ"].eq("Exit"),
+                comb_df["HoldDays"].fillna(-1).between(hold_sel[0], hold_sel[1]),
+                True
+            )
 
-            styled_rt = rt_disp.style.format({
-                "Entry Price":"{:.2f}","Exit Price":"{:.2f}",
-                "PnL Net (€)":"{:.2f}","Fees (€)":"{:.2f}","Return (%)":"{:.2f}",
-                "Entry Prob":"{:.4f}","Exit Prob":"{:.4f}"
+            comb_f = comb_df.loc[mask].copy()
+            comb_f_disp = comb_f.copy()
+            comb_f_disp["Date"] = comb_f_disp["Date"].dt.strftime("%Y-%m-%d")
+
+            wanted = ["Ticker", "Name", "Date", "Typ", "Price", "Shares", "Prob", "HoldDays", "Net P&L", "kum P&L", "Fees"]
+            cols_present = [c for c in wanted if c in comb_f_disp.columns]
+            styled_comb = comb_f_disp[cols_present].rename(columns={"Prob": "Signal Prob", "HoldDays": "Hold (days)"}).style.format({
+                "Price": "{:.2f}", "Shares": "{:.4f}", "Signal Prob": "{:.4f}", "Net P&L": "{:.2f}", "kum P&L": "{:.2f}", "Fees": "{:.2f}"
             })
-            show_styled_or_plain(rt_disp, styled_rt)
+            show_styled_or_plain(comb_f_disp[cols_present].rename(columns={"Prob": "Signal Prob", "HoldDays": "Hold (days)"}), styled_comb)
             st.download_button(
-                "Round-Trips als CSV",
-                rt_disp.to_csv(index=False).encode("utf-8"),
-                file_name="round_trips.csv", mime="text/csv"
+                "Gefilterte Events als CSV",
+                comb_f_disp[cols_present].to_csv(index=False).encode("utf-8"),
+                file_name="trades_events_filtered.csv",
+                mime="text/csv"
             )
+
+    # ─────────────────────────────────────────────────────────
+    # Round-Trips (Entry→Exit) – immer anzeigen
+    # ─────────────────────────────────────────────────────────
+    rt_df = compute_round_trips(all_trades)
+
+    st.subheader("🔁 Abgeschlossene Trades (Round-Trips)")
+    if rt_df.empty:
+        st.info("Keine abgeschlossenen Trades gefunden (keine Exit-Events im Backtest-Zeitraum).")
+    else:
+        rt_df = rt_df.sort_values(["Ticker", "Entry Date"]).copy()
+        # hübsch & sauber: ganze Tage ohne Komma
+        rt_df["Entry Date"] = pd.to_datetime(rt_df["Entry Date"]).dt.strftime("%Y-%m-%d")
+        rt_df["Exit Date"]  = pd.to_datetime(rt_df["Exit Date"]).dt.strftime("%Y-%m-%d")
+        rt_df["Hold (days)"] = rt_df["Hold (days)"].astype("Int64")
+
+        styled_rt = rt_df.style.format({
+            "Entry Price": "{:.2f}",
+            "Exit Price": "{:.2f}",
+            "PnL Net (€)": "{:.2f}",
+            "Fees (€)": "{:.2f}",
+            "Return (%)": "{:.2f}",
+            "Entry Prob": "{:.4f}",
+            "Exit Prob": "{:.4f}",
+        })
+        show_styled_or_plain(rt_df, styled_rt)
+
+        st.download_button(
+            "Round-Trips als CSV",
+            rt_df.to_csv(index=False).encode("utf-8"),
+            file_name="round_trips.csv",
+            mime="text/csv"
+        )
+
 else:
     st.warning("Noch keine Ergebnisse verfügbar. Stelle sicher, dass mindestens ein Ticker korrekt eingegeben ist und genügend Daten vorhanden sind.")
-
-
-
-
-
