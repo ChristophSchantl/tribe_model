@@ -20,9 +20,6 @@ from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import plotly.express as px
 
-# Neu: für CSV-Vorlagen
-import os, glob, io
-
 # ─────────────────────────────────────────────────────────────
 # Config / Globals
 # ─────────────────────────────────────────────────────────────
@@ -30,7 +27,7 @@ st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 
 # ─────────────────────────────────────────────────────────────
-# Helper – Tickerlisten / CSV / Vorlagen
+# Helper – Tickerlisten / CSV / Vorlagen (ohne Ordner-Suche)
 # ─────────────────────────────────────────────────────────────
 def _normalize_tickers(items: List[str]) -> List[str]:
     """Trim + upper + dedupe, erhalte Reihenfolge."""
@@ -65,21 +62,6 @@ def parse_ticker_csv(path_or_buffer) -> List[str]:
     first = df.columns[0]
     return _normalize_tickers(df[first].astype(str).tolist())
 
-def discover_builtin_lists(folder: str = "lists") -> Dict[str, str]:
-    """
-    Rekursiv *.csv in ./lists finden.
-    Rückgabe: {anzeigename: pfad}  (anzeigename ohne .csv, z.B. 'US/sp500')
-    """
-    result = {}
-    try:
-        for p in glob.glob(os.path.join(folder, "**", "*.csv"), recursive=True):
-            rel = os.path.relpath(p, folder)
-            name = os.path.splitext(rel)[0].replace("\\", "/")
-            result[name] = p
-    except Exception:
-        pass
-    return result
-
 def get_embedded_lists() -> Dict[str, List[str]]:
     """
     Eingebettete (im Code hinterlegte) Vorlagen – optional.
@@ -109,10 +91,10 @@ def get_embedded_lists() -> Dict[str, List[str]]:
 # ─────────────────────────────────────────────────────────────
 st.sidebar.header("Parameter")
 
-# Neu: Quelle für Ticker wählen
+# Quelle für Ticker wählen (ohne Ordner-Suche)
 ticker_source = st.sidebar.selectbox(
     "Ticker-Quelle",
-    ["Manuell (Textfeld)", "CSV-Upload", "Vordefiniert (aus ./lists)"],
+    ["Manuell (Textfeld)", "CSV-Upload", "Vordefiniert (eingebettet)"],
     index=0
 )
 
@@ -151,52 +133,29 @@ elif ticker_source == "CSV-Upload":
         # Feintuning
         tickers_final = st.sidebar.multiselect("Auswahl verfeinern", options=tickers_final, default=tickers_final)
 
-elif ticker_source == "Vordefiniert (aus ./lists)":
-    builtins_files = discover_builtin_lists("lists")  # ./lists rekursiv
-    embedded = get_embedded_lists()                  # im Code hinterlegt
-
-    tabs = st.sidebar.tabs(["Aus Ordner ./lists", "Eingebettet (im Code)"])
+elif ticker_source == "Vordefiniert (eingebettet)":
+    embedded = get_embedded_lists()  # im Code hinterlegt
     combined = []
-
-    with tabs[0]:
-        if not builtins_files:
-            st.warning("Keine CSVs in ./lists gefunden. Lege Dateien dort ab (rekursiv möglich).")
-        else:
-            choices = st.multiselect(
-                "Listen wählen (mehrfach möglich)",
-                options=sorted(builtins_files.keys()),
-                help="Mehrere Templates kombinieren – Ticker werden dedupliziert."
-            )
-            if choices:
-                for name in choices:
-                    path = builtins_files[name]
-                    try:
-                        combined += parse_ticker_csv(path)
-                    except Exception as e:
-                        st.error(f"Fehler in Liste '{name}': {e}")
-
-    with tabs[1]:
-        if embedded:
-            emb_choices = st.multiselect(
-                "Eingebettete Listen wählen",
-                options=sorted(embedded.keys()),
-                help="Im Code mitgelieferte Auszüge, jederzeit erweiterbar."
-            )
-            for nm in emb_choices:
-                combined += (embedded.get(nm) or [])
-
+    if embedded:
+        emb_choices = st.sidebar.multiselect(
+            "Eingebettete Listen wählen",
+            options=sorted(embedded.keys()),
+            help="Im Code mitgelieferte Auszüge, jederzeit erweiterbar."
+        )
+        for nm in emb_choices:
+            combined += (embedded.get(nm) or [])
     tickers_final = _normalize_tickers(combined)
 
     if tickers_final:
         st.sidebar.caption(f"Gefundene Ticker (vereint & dedupliziert): {len(tickers_final)}")
 
-        shuffle_lists = st.sidebar.checkbox("Zufällig mischen", value=False, key="shuffle_builtins")
+        shuffle_lists = st.sidebar.checkbox("Zufällig mischen", value=False, key="shuffle_embed")
         if shuffle_lists:
             import random
             random.seed(42); random.shuffle(tickers_final)
 
         max_n = st.sidebar.number_input("Max. Anzahl (0 = alle)", min_value=0, max_value=len(tickers_final),
-                                        value=min(50, len(tickers_final)), step=10, key="maxn_builtins")
+                                        value=min(50, len(tickers_final)), step=10, key="maxn_embed")
         if max_n and max_n < len(tickers_final):
             tickers_final = tickers_final[:int(max_n)]
 
