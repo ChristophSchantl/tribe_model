@@ -1056,6 +1056,29 @@ if results:
                 st.plotly_chart(fig_corr, use_container_width=True)
                 st.caption(f"Basis: {len(common_rows)} gemeinsame Zeitpunkte · Frequenz: {corr_freq} · Methode: {corr_method}")
 
+        # ── Einzelzahl(en) zur Portfolio-Korrelation ─────────────────
+        N = corr.shape[0]
+        if N >= 2:
+            # Alle Off-Diagonal-Werte (paarweise Korrelationen)
+            tri_vals = corr.where(~np.eye(N, dtype=bool)).stack()
+            avg_pair = float(tri_vals.mean())
+            med_pair = float(tri_vals.median())
+            std_pair = float(tri_vals.std())
+        
+            # Gleichgewichtete Intra-Portfolio-Korrelation (roh & normiert 0..1)
+            w = np.full(N, 1.0 / N)
+            ip_corr_raw = float(w @ corr.values @ w)                  # in [1/N, 1]
+            ip_corr_norm = float((ip_corr_raw - 1.0/N) / (1.0 - 1.0/N))
+        
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Ø Paar-Korrelation", f"{avg_pair:.2f}")
+            mc2.metric("Median", f"{med_pair:.2f}")
+            mc3.metric("Streuung (σ)", f"{std_pair:.2f}")
+            mc4.metric("Portfolio-Korrelation (normiert)", f"{ip_corr_norm:.2f}")
+        
+            st.caption(
+                f"IPC roh={ip_corr_raw:.3f} · normiert={ip_corr_norm:.3f} · N={N} · Methode: {corr_method}"
+            )
 
     
     else:
