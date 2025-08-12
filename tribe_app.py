@@ -78,12 +78,6 @@ def get_embedded_lists() -> Dict[str, List[str]]:
         "Watch Liste A": _normalize_tickers([
             "MRK.DE","IFX.DE","BEI.DE","SRT3.DE","PAH3.DE"
         ]),
-        "Austria": _normalize_tickers([
-            "EBS.VI","OMV.VI","VER.VI","VOE.VI","RBI.VI","ANDR.VI","DO&CO.VI","SBO.VI"
-        ]),
-        "HK/HangSeng (Auszug)": _normalize_tickers([
-            "0700.HK","1299.HK","0939.HK","2318.HK","1398.HK","0005.HK","0388.HK"
-        ]),
     }
 
 # ─────────────────────────────────────────────────────────────
