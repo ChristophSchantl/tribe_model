@@ -93,8 +93,8 @@ def get_embedded_lists() -> Dict[str, List[str]]:
             "SSREY","IMB.L","HOT.F","EOAN.DE","04Q.F","BACHY","EBS","TLX.DE","FTE.F",
             "TEF","BMT.F","FO4N.F","KGX.DE","RIO","MDT","CNE.SG","KSS","DWS.DE","MRK.DE","PC60.F","CPP.F"
         ]),
-        "US/S&P500 (Auszug)": _normalize_tickers([
-            "AAPL","MSFT","AMZN","META","GOOGL","BRK-B","NVDA","JPM","XOM","UNH","V","HD","PG","MA"
+        "Watch Liste A": _normalize_tickers([
+            "MRK.DE","IFX.DE","BEI.DE","SRT3.DE","PAH3.DE"
         ]),
         "Austria": _normalize_tickers([
             "EBS.VI","OMV.VI","VER.VI","VOE.VI","RBI.VI","ANDR.VI","DO&CO.VI","SBO.VI"
