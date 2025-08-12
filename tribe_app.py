@@ -30,7 +30,7 @@ LOCAL_TZ = ZoneInfo("Europe/Zurich")
 # Sidebar / Parameter
 # ─────────────────────────────────────────────────────────────
 st.sidebar.header("Parameter")
-tickers_input = st.sidebar.text_input("Tickers (Comma-separated)", value="BABA,QBTS,VOW3.DE,INTC")
+tickers_input = st.sidebar.text_input("Tickers (Comma-separated)", value="BABA,QBTS,RQ0.F,VOW3.DE,INTC,BIDU,0700.HK,LUMN,2318.HK")
 TICKERS = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
 START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2024-01-01"))
