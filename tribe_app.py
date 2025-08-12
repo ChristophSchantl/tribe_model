@@ -5,102 +5,65 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*figure layout has changed to tight.*")
 
-import streamlit as st
-import yfinance as yf
-import numpy as np
-import pandas as pd
+import sys
+import subprocess
+import importlib
 from math import sqrt
 from datetime import datetime, timedelta
 from typing import Tuple, List, Dict, Optional
-from zoneinfo import ZoneInfo
 
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import streamlit as st
 
 import plotly.graph_objects as go
 import plotly.express as px
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from zoneinfo import ZoneInfo
+
+# ─────────────────────────────────────────────────────────────
+# Ensure HTML parsers (lxml/html5lib/bs4) are available
+# ─────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=True)
+def ensure_html_parsers():
+    need = {
+        "lxml": "lxml",
+        "html5lib": "html5lib",
+        "beautifulsoup4": "bs4",
+    }
+    missing = []
+    for pip_name, mod_name in need.items():
+        try:
+            importlib.import_module(mod_name)
+        except Exception:
+            missing.append(pip_name)
+
+    if missing:
+        st.info("Installiere Parser: " + ", ".join(missing))
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *missing]
+            )
+        except Exception as e:
+            st.warning(f"Installation fehlgeschlagen: {e}")
+
+    # final probe
+    for mod_name in need.values():
+        importlib.import_module(mod_name)
+
+ensure_html_parsers()
 
 # ─────────────────────────────────────────────────────────────
 # Config / Globals
 # ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Signal-basierte Strategie Backtest", layout="wide")
+st.set_page_config(page_title="AI Signal-based Trading-Strategy", layout="wide")
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 
 # ─────────────────────────────────────────────────────────────
-# Sidebar / Parameter
-# ─────────────────────────────────────────────────────────────
-st.sidebar.header("Universum")
-universe_source = st.sidebar.selectbox(
-    "Quelle",
-    ["Manuell (Textfeld)", "S&P 500", "NASDAQ-100", "DAX 40", "ATX", "CSV Upload (Yahoo/ Eigen)"],
-    index=0
-)
-
-tickers_input = st.sidebar.text_input(
-    "Tickers (Comma-separated)",
-    value="BABA,QBTS,VOW3.DE,INTC",
-    key="tickers_text"
-)
-
-uploaded_csv = None
-if universe_source == "CSV Upload (Yahoo/ Eigen)":
-    uploaded_csv = st.sidebar.file_uploader("CSV mit Symbolen (Spalte: Symbol oder Ticker)", type=["csv"])
-
-max_universe = st.sidebar.number_input("Max. Anzahl Ticker im Universum (Performance)", 10, 1000, 200, 10)
-top_k = st.sidebar.number_input("Top-K nach Sharpe zeigen", 5, 50, 10, 1)
-
-# Parallelisierung fürs Ranking
-use_parallel = st.sidebar.checkbox("Parallel Ranking", value=True)
-max_workers = st.sidebar.slider("Max Worker (Threads)", 1, 32, 8, help="5–10 ist meist ideal (Rate Limits beachten)")
-
-run_batch_btn = st.sidebar.button("🚀 Universum backtesten & Top-K zeigen")
-
-st.sidebar.header("Parameter")
-START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2024-01-01"))
-END_DATE   = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.now(LOCAL_TZ).date()))
-
-LOOKBACK = st.sidebar.number_input("Lookback (Tage)", min_value=10, max_value=252, value=60, step=5)
-HORIZON  = st.sidebar.number_input("Horizon (Tage)", min_value=1, max_value=10, value=2)
-THRESH   = st.sidebar.number_input("Threshold für Target", min_value=0.0, max_value=0.1, value=0.02, step=0.005, format="%.3f")
-
-ENTRY_PROB = st.sidebar.slider("Entry Threshold (P(Signal))", min_value=0.0, max_value=1.0, value=0.63, step=0.01)
-EXIT_PROB  = st.sidebar.slider("Exit Threshold (P(Signal))",  min_value=0.0, max_value=1.0, value=0.46, step=0.01)
-
-COMMISSION   = st.sidebar.number_input("Commission (ad valorem, z.B. 0.001=10bp)", min_value=0.0, max_value=0.02, value=0.004, step=0.0001, format="%.4f")
-SLIPPAGE_BPS = st.sidebar.number_input("Slippage (bp je Ausführung)", min_value=0, max_value=50, value=5, step=1)
-POS_FRAC     = st.sidebar.slider("Max. Positionsgröße (% des Kapitals)", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
-
-# Positionssizing: fixed vs. ATR-risk
-sizing_mode = st.sidebar.selectbox("Positionsgröße", ["Fixed Fraction", "ATR Risk %"], index=0)
-atr_lookback = st.sidebar.number_input("ATR Lookback (Tage)", min_value=5, max_value=100, value=14, step=1)
-atr_k        = st.sidebar.number_input("ATR-Multiplikator (Stop-Distanz in ATR)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
-risk_per_trade_pct = st.sidebar.number_input("Risiko pro Trade (% vom Kapital)", min_value=0.1, max_value=5.0, value=1.0, step=0.1) / 100.0
-
-INIT_CAP = st.sidebar.number_input("Initial Capital  (€)", min_value=1000.0, value=10_000.0, step=1000.0, format="%.2f")
-
-# Intraday-Tail Optionen
-use_live = st.sidebar.checkbox("Letzten Tag intraday aggregieren (falls verfügbar)", value=True)
-intraday_interval = st.sidebar.selectbox("Intraday-Intervall (Tail & 5-Tage-Chart)", ["1m", "2m", "5m", "15m"], index=2)
-fallback_last_session = st.sidebar.checkbox("Fallback: letzte Session verwenden (wenn heute leer)", value=False)
-
-exec_mode = st.sidebar.selectbox("Execution Mode", ["Next Open (backtest+live)", "Market-On-Close (live only)"])
-moc_cutoff_min = st.sidebar.number_input("MOC Cutoff (Minuten vor Close, nur live)", min_value=5, max_value=60, value=15, step=5)
-
-# Intraday-Chart-Typ
-intraday_chart_type = st.sidebar.selectbox("Intraday-Chart", ["Candlestick (OHLC)", "Close-Linie"], index=0)
-
-st.sidebar.markdown("**Modellparameter**")
-n_estimators  = st.sidebar.number_input("n_estimators",  min_value=10, max_value=500, value=100, step=10)
-learning_rate = st.sidebar.number_input("learning_rate", min_value=0.01, max_value=1.0, value=0.1, step=0.01, format="%.2f")
-max_depth     = st.sidebar.number_input("max_depth",     min_value=1, max_value=10, value=3, step=1)
-
-MODEL_PARAMS = dict(n_estimators=int(n_estimators), learning_rate=float(learning_rate), max_depth=int(max_depth), random_state=42)
-
-# ─────────────────────────────────────────────────────────────
-# Helper
+# Helpers
 # ─────────────────────────────────────────────────────────────
 def show_styled_or_plain(df: pd.DataFrame, styler):
     try:
@@ -108,14 +71,21 @@ def show_styled_or_plain(df: pd.DataFrame, styler):
         if callable(html):
             st.markdown(html(), unsafe_allow_html=True)
         else:
-            raise AttributeError("Der übergebene Styler hat keine to_html-Methode")
+            raise AttributeError("Styler has no to_html")
     except Exception as e:
         st.warning(f"Styled-Tabelle konnte nicht gerendert werden, zeige einfache Tabelle. ({e})")
         st.dataframe(df)
 
 def slope(arr: np.ndarray) -> float:
     x = np.arange(len(arr))
-    return np.polyfit(x, arr, 1)[0]
+    return float(np.polyfit(x, arr, 1)[0]) if len(arr) > 1 else 0.0
+
+def normalize_yahoo_symbol(sym: str, suffix: Optional[str] = None) -> str:
+    s = str(sym).strip().upper().replace(" ", "")
+    s = s.replace(".", "-")
+    if suffix and not s.endswith(suffix):
+        s = s + suffix
+    return s
 
 def last_timestamp_info(df: pd.DataFrame, meta: Optional[dict] = None):
     ts = df.index[-1]
@@ -124,7 +94,6 @@ def last_timestamp_info(df: pd.DataFrame, meta: Optional[dict] = None):
         msg += f" (intraday bis {meta['tail_ts'].strftime('%H:%M %Z')})"
     st.caption(msg)
 
-# Name-Lookup (gecached)
 @st.cache_data(show_spinner=False, ttl=24*60*60)
 def get_ticker_name(ticker: str) -> str:
     try:
@@ -141,122 +110,105 @@ def get_ticker_name(ticker: str) -> str:
         pass
     return ticker
 
-# ATR
-def add_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    prev_close = df["Close"].shift(1)
-    tr1 = df["High"] - df["Low"]
-    tr2 = (df["High"] - prev_close).abs()
-    tr3 = (df["Low"]  - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(n).mean()
-    return atr
-
 # ─────────────────────────────────────────────────────────────
-# Universen laden (Wikipedia) + CSV & Validierung
+# Index/Universe Loader (Wikipedia) + Fallback
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=6*60*60)
 def fetch_sp500_symbols() -> List[str]:
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         tables = pd.read_html(url)
-        df = tables[0]
-        syms = df["Symbol"].astype(str).str.upper()
-        syms = syms.str.replace(r"\.", "-", regex=True)
-        return syms.tolist()
+        df = next(t for t in tables if "Symbol" in t.columns)
+        syms = (
+            df["Symbol"].astype(str).str.upper()
+            .str.replace(r"\.", "-", regex=True)
+            .str.replace(r"\s+", "", regex=True)
+            .tolist()
+        )
+        # Bekannte Sonderfälle korrigieren
+        return [s.replace("BRK-B", "BRK-B").replace("BF-B", "BF-B") for s in syms]
     except Exception as e:
-        st.warning(f"S&P 500 Liste konnte nicht geladen werden ({e}).")
-        return []
+        st.warning(f"S&P 500 Liste konnte nicht geladen werden ({e}). Fallback wird genutzt.")
+        # sehr kleiner Fallback
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "JPM", "XOM", "LLY"]
 
 @st.cache_data(show_spinner=False, ttl=6*60*60)
 def fetch_nasdaq100_symbols() -> List[str]:
+    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
     try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
         tables = pd.read_html(url)
-        df = next(t for t in tables if "Ticker" in t.columns or "Symbol" in t.columns)
+        # Tabelle mit Symbol/Ticker finden
+        df = None
+        for t in tables:
+            if any(c.lower() in ["ticker", "symbol"] for c in map(str.lower, t.columns)):
+                df = t
+                break
+        if df is None:
+            raise ValueError("Keine passende Tabelle gefunden.")
         col = "Ticker" if "Ticker" in df.columns else "Symbol"
-        syms = df[col].astype(str).str.upper().str.replace(r"\.", "-", regex=True)
-        return syms.tolist()
+        syms = (
+            df[col].astype(str).str.upper()
+            .str.replace(r"\.", "-", regex=True)
+            .str.replace(r"\s+", "", regex=True)
+            .tolist()
+        )
+        return syms
     except Exception as e:
-        st.warning(f"NASDAQ-100 Liste konnte nicht geladen werden ({e}).")
-        return []
+        st.warning(f"NASDAQ-100 Liste konnte nicht geladen werden ({e}). Fallback wird genutzt.")
+        return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "AVGO", "COST", "PEP"]
 
 @st.cache_data(show_spinner=False, ttl=6*60*60)
 def fetch_dax40_symbols() -> List[str]:
+    url = "https://en.wikipedia.org/wiki/DAX"
     try:
-        url = "https://en.wikipedia.org/wiki/DAX"
         tables = pd.read_html(url)
-        df = next(t for t in tables if ("Ticker symbol" in t.columns) or ("Ticker" in t.columns) or ("Symbol" in t.columns))
-        for c in ["Ticker symbol", "Ticker", "Symbol"]:
-            if c in df.columns:
-                base = df[c].astype(str).str.upper().str.replace(r"\.", "-", regex=True).str.replace(r"\s+", "", regex=True)
-                return (base + ".DE").tolist()
-        return []
+        df = None
+        for t in tables:
+            if any(c.lower() in ["ticker symbol", "ticker", "symbol"] for c in map(str.lower, t.columns)):
+                df = t
+                break
+        if df is None:
+            raise ValueError("Keine passende Tabelle gefunden.")
+        col = next(c for c in df.columns if c.lower() in ["ticker symbol", "ticker", "symbol"])
+        base = (
+            df[col].astype(str).str.upper()
+            .str.replace(r"\.", "-", regex=True)
+            .str.replace(r"\s+", "", regex=True)
+        )
+        return (base + ".DE").tolist()
     except Exception as e:
-        st.warning(f"DAX 40 Liste konnte nicht geladen werden ({e}).")
-        return []
+        st.warning(f"DAX 40 Liste konnte nicht geladen werden ({e}). Fallback wird genutzt.")
+        return [
+            "SAP.DE","SIE.DE","ALV.DE","BAS.DE","BAYN.DE","BMW.DE","BEI.DE","CON.DE","DB1.DE","DBK.DE",
+            "DTE.DE","EOAN.DE","FRE.DE","HEI.DE","HEN3.DE","IFX.DE","MRK.DE","MUV2.DE","P911.DE","RWE.DE",
+            "SRT3.DE","VOW3.DE","PAH3.DE","BNR.DE","DTG.DE","MTX.DE","KNF.DE"
+        ]
 
 @st.cache_data(show_spinner=False, ttl=6*60*60)
 def fetch_atx_symbols() -> List[str]:
+    url = "https://en.wikipedia.org/wiki/ATX_(Austrian_Traded_Index)"
     try:
-        url = "https://en.wikipedia.org/wiki/ATX_(Austrian_Traded_Index)"
         tables = pd.read_html(url)
-        df = next(t for t in tables if ("Ticker" in t.columns) or ("Symbol" in t.columns))
+        df = None
+        for t in tables:
+            if any(c.lower() in ["ticker", "symbol"] for c in map(str.lower, t.columns)):
+                df = t
+                break
+        if df is None:
+            raise ValueError("Keine passende Tabelle gefunden.")
         col = "Ticker" if "Ticker" in df.columns else "Symbol"
-        base = df[col].astype(str).str.upper().str.replace(r"\.", "-", regex=True).str.replace(r"\s+", "", regex=True)
+        base = (
+            df[col].astype(str).str.upper()
+            .str.replace(r"\.", "-", regex=True)
+            .str.replace(r"\s+", "", regex=True)
+        )
         return (base + ".VI").tolist()
     except Exception as e:
-        st.warning(f"ATX Liste konnte nicht geladen werden ({e}).")
-        return []
-
-def parse_uploaded_csv(file) -> List[str]:
-    try:
-        df = pd.read_csv(file)
-    except Exception:
-        df = pd.read_csv(file, sep=";")
-    cols = [c.lower() for c in df.columns]
-    sym_col = None
-    for cand in ["symbol", "ticker", "sym", "ric"]:
-        if cand in cols:
-            sym_col = df.columns[cols.index(cand)]
-            break
-    if sym_col is None:
-        st.warning("Keine Spalte 'Symbol' oder 'Ticker' gefunden. Verwende erste Spalte als Fallback.")
-        sym_col = df.columns[0]
-    syms = df[sym_col].astype(str).str.strip().str.upper().str.replace(r"\.", "-", regex=True)
-    return syms.tolist()
-
-def get_universe(universe_source: str, tickers_text: str, uploaded_csv, cap: int) -> List[str]:
-    if universe_source == "S&P 500":
-        syms = fetch_sp500_symbols()
-    elif universe_source == "NASDAQ-100":
-        syms = fetch_nasdaq100_symbols()
-    elif universe_source == "DAX 40":
-        syms = fetch_dax40_symbols()
-    elif universe_source == "ATX":
-        syms = fetch_atx_symbols()
-    elif universe_source == "CSV Upload (Yahoo/ Eigen)" and uploaded_csv is not None:
-        syms = parse_uploaded_csv(uploaded_csv)
-    else:
-        syms = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
-    syms = list(dict.fromkeys(syms))  # de-dup
-    return syms[:cap]
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def validate_yahoo_symbols(symbols: List[str], interval: str = "1d") -> Tuple[List[str], List[str]]:
-    valid, invalid = [], []
-    for s in symbols:
-        try:
-            df = yf.Ticker(s).history(period="5d", interval=interval, auto_adjust=True, actions=False, prepost=False)
-            if isinstance(df, pd.DataFrame) and not df.empty and pd.notna(df["Close"]).any():
-                valid.append(s)
-            else:
-                invalid.append(s)
-        except Exception:
-            invalid.append(s)
-    return valid, invalid
+        st.warning(f"ATX Liste konnte nicht geladen werden ({e}). Fallback wird genutzt.")
+        return ["OMV.VI","EBS.VI","VIG.VI","VER.VI","ANDR.VI","RBI.VI","TEL.VI","VOE.VI","BSL.VI","IIA.VI"]
 
 # ─────────────────────────────────────────────────────────────
-# Daten: 1D-Historie + NUR-HEUTE Intraday-Tail
+# Data: Daily + Intraday tail (today only)
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
 def get_price_data_tail_intraday(
@@ -268,71 +220,68 @@ def get_price_data_tail_intraday(
     exec_mode_key: str = "Next Open (backtest+live)",
     moc_cutoff_min_val: int = 15,
 ) -> Tuple[pd.DataFrame, dict]:
-    tk = yf.Ticker(ticker)
+        tk = yf.Ticker(ticker)
 
-    df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
-    if df.empty:
-        raise ValueError(f"Keine Daten für {ticker}")
+        df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
+        if df.empty:
+            raise ValueError(f"Keine Daten für {ticker}")
 
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    df.index = df.index.tz_convert(LOCAL_TZ)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        df.index = df.index.tz_convert(LOCAL_TZ)
 
-    meta = {"tail_is_intraday": False, "tail_ts": None}
+        meta = {"tail_is_intraday": False, "tail_ts": None}
 
-    if not use_tail:
+        if not use_tail:
+            df.dropna(subset=["High", "Low", "Close"], inplace=True)
+            return df, meta
+
+        try:
+            intraday = tk.history(period="1d", interval=interval, auto_adjust=True, actions=False, prepost=False)
+            if not intraday.empty:
+                if intraday.index.tz is None:
+                    intraday.index = intraday.index.tz_localize("UTC")
+                intraday.index = intraday.index.tz_convert(LOCAL_TZ)
+            else:
+                intraday = pd.DataFrame()
+        except Exception:
+            intraday = pd.DataFrame()
+
+        if exec_mode_key.startswith("Market-On-Close") and not intraday.empty:
+            now_local = datetime.now(LOCAL_TZ)
+            cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min_val))
+            intraday = intraday.loc[:cutoff_time]
+
+        if intraday.empty and fallback_last_session:
+            try:
+                intraday5 = tk.history(period="5d", interval=interval, auto_adjust=True, actions=False, prepost=False)
+                if not intraday5.empty:
+                    if intraday5.index.tz is None:
+                        intraday5.index = intraday5.index.tz_localize("UTC")
+                    intraday5.index = intraday5.index.tz_convert(LOCAL_TZ)
+                    last_session_date = intraday5.index[-1].date()
+                    intraday = intraday5.loc[str(last_session_date)]
+            except Exception:
+                pass
+
+        if not intraday.empty:
+            last_bar = intraday.iloc[-1]
+            day_key = pd.Timestamp(last_bar.name.date(), tz=LOCAL_TZ)
+            daily_row = {
+                "Open":   float(intraday["Open"].iloc[0]),
+                "High":   float(intraday["High"].max()),
+                "Low":    float(intraday["Low"].min()),
+                "Close":  float(last_bar["Close"]),
+                "Volume": float(intraday["Volume"].sum()),
+            }
+            df.loc[day_key] = daily_row
+            df = df.sort_index()
+            meta["tail_is_intraday"] = True
+            meta["tail_ts"] = last_bar.name
+
         df.dropna(subset=["High", "Low", "Close"], inplace=True)
         return df, meta
 
-    try:
-        intraday = tk.history(period="1d", interval=interval, auto_adjust=True, actions=False, prepost=False)
-        if not intraday.empty:
-            if intraday.index.tz is None:
-                intraday.index = intraday.index.tz_localize("UTC")
-            intraday.index = intraday.index.tz_convert(LOCAL_TZ)
-        else:
-            intraday = pd.DataFrame()
-    except Exception:
-        intraday = pd.DataFrame()
-
-    if exec_mode_key.startswith("Market-On-Close") and not intraday.empty:
-        now_local = datetime.now(LOCAL_TZ)
-        cutoff_time = now_local - timedelta(minutes=int(moc_cutoff_min_val))
-        intraday = intraday.loc[:cutoff_time]
-
-    if intraday.empty and fallback_last_session:
-        try:
-            intraday5 = tk.history(period="5d", interval=interval, auto_adjust=True, actions=False, prepost=False)
-            if not intraday5.empty:
-                if intraday5.index.tz is None:
-                    intraday5.index = intraday5.index.tz_localize("UTC")
-                intraday5.index = intraday5.index.tz_convert(LOCAL_TZ)
-                last_session_date = intraday5.index[-1].date()
-                intraday = intraday5.loc[str(last_session_date)]
-        except Exception:
-            pass
-
-    if not intraday.empty:
-        last_bar = intraday.iloc[-1]
-        day_key = pd.Timestamp(last_bar.name.date(), tz=LOCAL_TZ)
-        daily_row = {
-            "Open":   float(intraday["Open"].iloc[0]),
-            "High":   float(intraday["High"].max()),
-            "Low":    float(intraday["Low"].min()),
-            "Close":  float(last_bar["Close"]),
-            "Volume": float(intraday["Volume"].sum()),
-        }
-        df.loc[day_key] = daily_row
-        df = df.sort_index()
-        meta["tail_is_intraday"] = True
-        meta["tail_ts"] = last_bar.name
-
-    df.dropna(subset=["High", "Low", "Close"], inplace=True)
-    return df, meta
-
-# ─────────────────────────────────────────────────────────────
-# Intraday-Fetch für letzten 5 Handelstage (für Neben-Chart)
-# ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
 def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: int = 10, interval: str = "5m") -> pd.DataFrame:
     tk = yf.Ticker(ticker)
@@ -349,8 +298,16 @@ def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: in
     return intr.loc[mask].copy()
 
 # ─────────────────────────────────────────────────────────────
-# Features & Training ohne Leakage
+# Features / Model / Backtest
 # ─────────────────────────────────────────────────────────────
+def add_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    prev_close = df["Close"].shift(1)
+    tr1 = df["High"] - df["Low"]
+    tr2 = (df["High"] - prev_close).abs()
+    tr3 = (df["Low"]  - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
 def make_features(df: pd.DataFrame, lookback: int, horizon: int) -> pd.DataFrame:
     feat = df.copy()
     feat["Range"]     = feat["High"].rolling(lookback).max() - feat["Low"].rolling(lookback).min()
@@ -360,42 +317,6 @@ def make_features(df: pd.DataFrame, lookback: int, horizon: int) -> pd.DataFrame
     feat["FutureRet"] = feat["Close"].shift(-horizon) / feat["Close"] - 1
     return feat
 
-@st.cache_data(show_spinner=False, ttl=120)
-def train_and_signal_no_leak(
-    df: pd.DataFrame,
-    lookback: int,
-    horizon: int,
-    threshold: float,
-    model_params: dict,
-    atr_lookback: int
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
-    feat = make_features(df, lookback, horizon)
-    feat["ATR"] = add_atr(df, n=atr_lookback).reindex(feat.index)
-
-    hist = feat.iloc[:-1].dropna(subset=["FutureRet"]).copy()
-    if len(hist) < 30:
-        raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
-
-    hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
-    X_cols = ["Range","SlopeHigh","SlopeLow"]
-    X_train, y_train = hist[X_cols].values, hist["Target"].values
-
-    scaler = StandardScaler().fit(X_train)
-    model  = GradientBoostingClassifier(**model_params).fit(scaler.transform(X_train), y_train)
-
-    feat["SignalProb"] = model.predict_proba(scaler.transform(feat[X_cols].values))[:,1]
-    feat_bt = feat.iloc[:-1].copy()  # letzte Zeile = live/out-of-sample
-
-    df_bt, trades = backtest_next_open(
-        feat_bt, ENTRY_PROB, EXIT_PROB, COMMISSION, SLIPPAGE_BPS,
-        INIT_CAP, POS_FRAC, sizing_mode, risk_per_trade_pct, atr_k
-    )
-    metrics = compute_performance(df_bt, trades, INIT_CAP)
-    return feat, df_bt, trades, metrics
-
-# ─────────────────────────────────────────────────────────────
-# Backtester: t-Signal → t+1 Open (incl. Prob & HoldDays)
-# ─────────────────────────────────────────────────────────────
 def backtest_next_open(
     df: pd.DataFrame,
     entry_thr: float,
@@ -425,7 +346,6 @@ def backtest_next_open(
     cum_pl_net = 0.0
 
     for i in range(n):
-        # --- Ausführung am Open von t (Signal von t-1) ---
         if i > 0:
             open_today = float(df["Open"].iloc[i])
             slip_buy  = open_today * (1 + slippage_bps / 10000.0)
@@ -434,7 +354,7 @@ def backtest_next_open(
             date_exec = df.index[i]
 
             if (not in_pos) and prob_prev > entry_thr:
-                # Positionsgröße
+                # Sizing
                 if sizing_mode == "ATR Risk %":
                     atr_prev = df.get("ATR", pd.Series(index=df.index)).iloc[i-1]
                     if np.isfinite(atr_prev) and atr_prev > 0:
@@ -493,11 +413,10 @@ def backtest_next_open(
                     "Shares": 0.0, "Gross P&L": round(pnl_gross, 2),
                     "Fees": round(fee_exit, 2), "Net P&L": round(pnl_net, 2),
                     "kum P&L": round(cum_pl_net, 2), "Prob": round(prob_prev, 4),
-                    "HoldDays": hold_days
+                    "HoldDays": int(hold_days) if np.isfinite(hold_days) else np.nan
                 })
                 last_entry_date = None
 
-        # --- Bewertung am Tagesende (Close) ---
         close_today = float(df["Close"].iloc[i])
         equity_gross.append(cash_gross + (shares * close_today if in_pos else 0.0))
         equity_net.append(cash_net + (shares * close_today if in_pos else 0.0))
@@ -507,9 +426,6 @@ def backtest_next_open(
     df_bt["Equity_Net"]   = equity_net
     return df_bt, trades
 
-# ─────────────────────────────────────────────────────────────
-# Performance-Kennzahlen
-# ─────────────────────────────────────────────────────────────
 def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float) -> dict:
     net_ret = (df_bt["Equity_Net"].iloc[-1] / init_cap - 1) * 100
     rets = df_bt["Equity_Net"].pct_change().dropna()
@@ -538,238 +454,294 @@ def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float
         "Net P&L (€)": round(net_eur, 2),
     }
 
-# Round-Trips (Entry→Exit) inkl. Haltedauer
-def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
-    rows = []
-    for tk, tr in all_trades.items():
-        name = get_ticker_name(tk)
-        current_entry = None
-        for ev in tr:
-            if ev["Typ"] == "Entry":
-                current_entry = ev
-            elif ev["Typ"] == "Exit" and current_entry is not None:
-                entry_date = pd.to_datetime(current_entry["Date"])
-                exit_date  = pd.to_datetime(ev["Date"])
-                hold_days  = (exit_date - entry_date).days
-                shares     = float(current_entry.get("Shares", 0.0))
-                entry_p    = float(current_entry.get("Price", np.nan))
-                exit_p     = float(ev.get("Price", np.nan))
-                fee_e      = float(current_entry.get("Fees", 0.0))
-                fee_x      = float(ev.get("Fees", 0.0))
-                pnl_net    = float(ev.get("Net P&L", 0.0))
-                cost_net   = shares * entry_p + fee_e
-                ret_pct    = (pnl_net / cost_net * 100.0) if cost_net else np.nan
-                rows.append({
-                    "Ticker": tk, "Name": name,
-                    "Entry Date": entry_date, "Exit Date": exit_date,
-                    "Hold (days)": hold_days,
-                    "Entry Prob": current_entry.get("Prob", np.nan),
-                    "Exit Prob":  ev.get("Prob", np.nan),
-                    "Shares": round(shares, 4),
-                    "Entry Price": round(entry_p, 4), "Exit Price": round(exit_p, 4),
-                    "PnL Net (€)": round(pnl_net, 2), "Fees (€)": round(fee_e + fee_x, 2),
-                    "Return (%)": round(ret_pct, 2),
-                })
-                current_entry = None
-    return pd.DataFrame(rows)
-
-# ─────────────────────────────────────────────────────────────
-# Batch-Run + Ranking nach Sharpe (parallel optional)
-# ─────────────────────────────────────────────────────────────
-def _eval_one_ticker(
-    t, start_date, end_date, lookback, horizon, threshold, model_params,
-    use_live, intraday_interval, fallback_last_session, exec_mode, moc_cutoff_min,
-    atr_lookback
+@st.cache_data(show_spinner=False, ttl=300)
+def run_backtest_for_ticker(
+    ticker: str,
+    years: int,
+    use_tail: bool,
+    intraday_interval: str,
+    fallback_last_session: bool,
+    exec_mode: str,
+    moc_cutoff_min: int,
+    start_date: Optional[pd.Timestamp],
+    end_date: Optional[pd.Timestamp],
+    lookback: int,
+    horizon: int,
+    threshold: float,
+    model_params: dict,
+    entry_prob: float,
+    exit_prob: float,
+    commission: float,
+    slippage_bps: int,
+    init_cap: float,
+    pos_frac: float,
+    sizing_mode: str,
+    atr_lookback: int,
+    atr_k: float,
+    risk_per_trade_pct: float,
 ):
-    try:
-        df_full, _ = get_price_data_tail_intraday(
-            t, years=2, use_tail=use_live, interval=intraday_interval,
-            fallback_last_session=fallback_last_session,
-            exec_mode_key=exec_mode, moc_cutoff_min_val=moc_cutoff_min
-        )
-        df = df_full.loc[str(start_date):str(end_date)].copy()
-        _, df_bt, trades, metrics = train_and_signal_no_leak(
-            df, lookback, horizon, threshold, model_params, atr_lookback
-        )
-        metrics["Ticker"] = t
-        metrics["Name"]   = get_ticker_name(t)
-        return metrics
-    except Exception as e:
-        return {"Ticker": t, "Name": get_ticker_name(t), "Sharpe-Ratio": -np.inf, "Error": str(e)}
-
-@st.cache_data(show_spinner=True, ttl=60)
-def batch_rank_tickers(
-    tickers: List[str],
-    start_date, end_date,
-    lookback, horizon, threshold, model_params,
-    use_live, intraday_interval, fallback_last_session, exec_mode, moc_cutoff_min,
-    atr_lookback,
-    parallel: bool = True, workers: int = 8
-) -> pd.DataFrame:
-    rows = []
-    runner = partial(
-        _eval_one_ticker,
-        start_date=start_date, end_date=end_date,
-        lookback=lookback, horizon=horizon, threshold=threshold, model_params=model_params,
-        use_live=use_live, intraday_interval=intraday_interval,
-        fallback_last_session=fallback_last_session, exec_mode=exec_mode, moc_cutoff_min=moc_cutoff_min,
-        atr_lookback=atr_lookback
+    # load data
+    df_full, meta = get_price_data_tail_intraday(
+        ticker, years=years, use_tail=use_tail, interval=intraday_interval,
+        fallback_last_session=fallback_last_session, exec_mode_key=exec_mode,
+        moc_cutoff_min_val=moc_cutoff_min
     )
+    df = df_full.copy()
+    if start_date is not None:
+        df = df.loc[str(start_date):]
+    if end_date is not None:
+        df = df.loc[:str(end_date)]
 
-    if parallel:
-        workers = max(1, int(workers))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(runner, t): t for t in tickers}
-            for fut in as_completed(futures):
-                rows.append(fut.result())
-    else:
-        for t in tickers:
-            rows.append(runner(t))
+    # features & model
+    feat = make_features(df, lookback, horizon)
+    feat["ATR"] = add_atr(df, n=atr_lookback).reindex(feat.index)
 
-    rank = pd.DataFrame(rows)
-    if "Sharpe-Ratio" in rank.columns:
-        rank = rank.sort_values("Sharpe-Ratio", ascending=False, na_position="last")
-    return rank.reset_index(drop=True)
+    hist = feat.iloc[:-1].dropna(subset=["FutureRet"]).copy()
+    if len(hist) < 30:
+        raise ValueError("Zu wenige Datenpunkte nach Preprocessing für das Modell.")
+
+    hist["Target"] = (hist["FutureRet"] > threshold).astype(int)
+    X_cols = ["Range","SlopeHigh","SlopeLow"]
+    X_train, y_train = hist[X_cols].values, hist["Target"].values
+
+    scaler = StandardScaler().fit(X_train)
+    model  = GradientBoostingClassifier(**model_params).fit(scaler.transform(X_train), y_train)
+
+    feat["SignalProb"] = model.predict_proba(scaler.transform(feat[X_cols].values))[:,1]
+    feat_bt = feat.iloc[:-1].copy()
+
+    df_bt, trades = backtest_next_open(
+        feat_bt, entry_prob, exit_prob, commission, slippage_bps,
+        init_cap, pos_frac, sizing_mode, risk_per_trade_pct, atr_k
+    )
+    metrics = compute_performance(df_bt, trades, init_cap)
+    return metrics, trades, df_bt, feat, meta
 
 # ─────────────────────────────────────────────────────────────
-# Haupt
+# Sidebar / Parameter
 # ─────────────────────────────────────────────────────────────
-st.markdown("<h1 style='font-size: 36px;'>📈 AI Signal-based Trading-Strategy</h1>", unsafe_allow_html=True)
+st.markdown("## 📈 AI Signal-based Trading-Strategy")
 
-# Universum bestimmen + validieren
-TICKERS = get_universe(universe_source, st.session_state["tickers_text"], uploaded_csv, max_universe)
-valid_syms, invalid_syms = validate_yahoo_symbols(TICKERS)
-if invalid_syms:
-    st.sidebar.warning(
-        f"{len(invalid_syms)} Symbole ohne Daten (übersprungen): "
-        + ", ".join(invalid_syms[:10]) + (" …" if len(invalid_syms) > 10 else "")
-    )
-TICKERS = valid_syms
-st.caption(f"Aktives Universum: {len(TICKERS)} Ticker")
+# Universum Auswahl
+st.sidebar.header("Universum")
+universe_source = st.sidebar.selectbox(
+    "Quelle",
+    ["Manuell (Textfeld)", "CSV Upload (Spalte: Symbol/Ticker)", "S&P 500 (Wikipedia)", "NASDAQ-100 (Wikipedia)", "DAX 40 (Wikipedia)", "ATX (Wikipedia)"],
+)
 
-# Universums-Ranking
-st.markdown("### 🔎 Universum-Ranking (Sharpe)")
-if run_batch_btn and TICKERS:
-    with st.spinner("Backtest läuft über das Universum ..."):
-        rank_df = batch_rank_tickers(
-            TICKERS, START_DATE, END_DATE,
-            LOOKBACK, HORIZON, THRESH, MODEL_PARAMS,
-            use_live, intraday_interval, fallback_last_session, exec_mode, moc_cutoff_min,
-            atr_lookback,
-            parallel=use_parallel, workers=max_workers
-        )
-    if not rank_df.empty:
-        top_df = rank_df.head(int(top_k)).copy()
-        styled = top_df.style.format({
-            "Sharpe-Ratio": "{:.2f}",
-            "Strategy Net (%)": "{:.2f}",
-            "Strategy Gross (%)": "{:.2f}",
-            "Buy & Hold Net (%)": "{:.2f}",
-            "Volatility (%)": "{:.2f}",
-            "Max Drawdown (%)": "{:.2f}",
-            "Fees (€)": "{:.2f}",
-            "Net P&L (€)": "{:.2f}",
-        })
-        st.subheader(f"🏆 Top {int(top_k)} nach Sharpe")
-        show_styled_or_plain(top_df, styled)
-        st.download_button(
-            "Ranking als CSV herunterladen",
-            rank_df.to_csv(index=False).encode("utf-8"),
-            file_name="universe_ranking.csv",
-            mime="text/csv"
-        )
-        st.info("🔁 Du kannst die Top-K Ticker kopieren und oben ins Textfeld einfügen, um Detail-Charts/Trades zu sehen.")
-else:
-    st.caption("Nutze links '🚀 Universum backtesten & Top-K zeigen', um den Lauf zu starten.")
+manual_input = st.sidebar.text_area("Manuelle Ticker (kommagetrennt)", value="AAPL,MSFT,NVDA")
+csv_file = st.sidebar.file_uploader("CSV Upload", type=["csv"])
 
-# Detail-Analyse je Ticker
-results = []
-all_trades: Dict[str, List[dict]] = {}
-all_dfs:   Dict[str, pd.DataFrame] = {}
-all_feat:  Dict[str, pd.DataFrame] = {}
+# Backtest-Settings
+st.sidebar.header("Backtest-Parameter")
+START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2024-01-01"))
+END_DATE   = st.sidebar.date_input("End Date",   value=pd.to_datetime(datetime.now(LOCAL_TZ).date()))
 
-for ticker in TICKERS:
-    with st.expander(f"🔍 Analyse für {ticker}", expanded=False):
-        st.subheader(f"{ticker}")
+LOOKBACK = st.sidebar.number_input("Lookback (Tage)", min_value=10, max_value=252, value=60, step=5)
+HORIZON  = st.sidebar.number_input("Horizon (Tage)", min_value=1, max_value=10, value=2)
+THRESH   = st.sidebar.number_input("Threshold für Target", min_value=0.0, max_value=0.1, value=0.02, step=0.005, format="%.3f")
+
+ENTRY_PROB = st.sidebar.slider("Entry Threshold (P(Signal))", min_value=0.0, max_value=1.0, value=0.63, step=0.01)
+EXIT_PROB  = st.sidebar.slider("Exit Threshold (P(Signal))",  min_value=0.0, max_value=1.0, value=0.46, step=0.01)
+
+COMMISSION   = st.sidebar.number_input("Commission (ad valorem, z.B. 0.001=10bp)", min_value=0.0, max_value=0.02, value=0.004, step=0.0001, format="%.4f")
+SLIPPAGE_BPS = st.sidebar.number_input("Slippage (bp je Ausführung)", min_value=0, max_value=50, value=5, step=1)
+POS_FRAC     = st.sidebar.slider("Max. Positionsgröße (% des Kapitals)", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
+INIT_CAP     = st.sidebar.number_input("Initial Capital  (€)", min_value=1000.0, value=10_000.0, step=1000.0, format="%.2f")
+
+sizing_mode = st.sidebar.selectbox("Positionsgröße", ["Fixed Fraction", "ATR Risk %"], index=0)
+atr_lookback = st.sidebar.number_input("ATR Lookback (Tage)", min_value=5, max_value=100, value=14, step=1)
+atr_k        = st.sidebar.number_input("ATR-Multiplikator (Stop-Distanz in ATR)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
+risk_per_trade_pct = st.sidebar.number_input("Risiko pro Trade (% vom Kapital)", min_value=0.1, max_value=5.0, value=1.0, step=0.1) / 100.0
+
+# Intraday Optionen
+st.sidebar.header("Intraday-Tail")
+use_live = st.sidebar.checkbox("Letzten Tag intraday aggregieren (falls verfügbar)", value=True)
+intraday_interval = st.sidebar.selectbox("Intraday-Intervall (Tail & 5-Tage-Chart)", ["1m", "2m", "5m", "15m"], index=2)
+fallback_last_session = st.sidebar.checkbox("Fallback: letzte Session verwenden (wenn heute leer)", value=False)
+exec_mode = st.sidebar.selectbox("Execution Mode", ["Next Open (backtest+live)", "Market-On-Close (live only)"])
+moc_cutoff_min = st.sidebar.number_input("MOC Cutoff (Minuten vor Close, nur live)", min_value=5, max_value=60, value=15, step=5)
+
+# Modell
+st.sidebar.header("Modellparameter")
+n_estimators  = st.sidebar.number_input("n_estimators",  min_value=10, max_value=500, value=100, step=10)
+learning_rate = st.sidebar.number_input("learning_rate", min_value=0.01, max_value=1.0, value=0.1, step=0.01, format="%.2f")
+max_depth     = st.sidebar.number_input("max_depth",     min_value=1, max_value=10, value=3, step=1)
+MODEL_PARAMS = dict(n_estimators=int(n_estimators), learning_rate=float(learning_rate), max_depth=int(max_depth), random_state=42)
+
+# Universum erstellen
+def build_universe() -> List[str]:
+    if universe_source == "Manuell (Textfeld)":
+        return [normalize_yahoo_symbol(t) for t in manual_input.split(",") if t.strip()]
+    elif universe_source == "CSV Upload (Spalte: Symbol/Ticker)":
+        if csv_file is None:
+            st.warning("Bitte CSV hochladen.")
+            return []
         try:
-            # 1D + nur-heute Intraday Tail
-            df_full, meta = get_price_data_tail_intraday(
-                ticker, years=2, use_tail=use_live,
-                interval=intraday_interval, fallback_last_session=fallback_last_session,
-                exec_mode_key=exec_mode, moc_cutoff_min_val=moc_cutoff_min
+            df = pd.read_csv(csv_file)
+        except Exception:
+            csv_file.seek(0)
+            df = pd.read_csv(csv_file, sep=";")
+        if "Symbol" in df.columns:
+            col = "Symbol"
+        elif "Ticker" in df.columns:
+            col = "Ticker"
+        else:
+            col = df.columns[0]
+        return [normalize_yahoo_symbol(s) for s in df[col].astype(str).tolist()]
+    elif universe_source == "S&P 500 (Wikipedia)":
+        return fetch_sp500_symbols()
+    elif universe_source == "NASDAQ-100 (Wikipedia)":
+        return fetch_nasdaq100_symbols()
+    elif universe_source == "DAX 40 (Wikipedia)":
+        return fetch_dax40_symbols()
+    elif universe_source == "ATX (Wikipedia)":
+        return fetch_atx_symbols()
+    return []
+
+universe = build_universe()
+st.caption(f"Aktives Universum: **{len(universe)}** Ticker")
+
+# ─────────────────────────────────────────────────────────────
+# Universum backtesten & ranken
+# ─────────────────────────────────────────────────────────────
+st.markdown("### 🔎 Universum-Ranking (Sharpe)")
+colk1, colk2 = st.columns([1, 2])
+with colk1:
+    run_rank = st.button("🚀 Universum backtesten & Top-K zeigen")
+with colk2:
+    TOP_K = st.slider("K (Top-Sharpe)", min_value=3, max_value=50, value=10, step=1)
+
+ranking_df = None
+topk = []
+per_ticker_cache: Dict[str, dict] = {}
+
+if run_rank and universe:
+    progress = st.progress(0.0)
+    rows = []
+    for i, tk in enumerate(universe):
+        progress.progress((i + 1) / max(1, len(universe)))
+        try:
+            metrics, trades, df_bt, feat, meta = run_backtest_for_ticker(
+                ticker=tk, years=2, use_tail=use_live, intraday_interval=intraday_interval,
+                fallback_last_session=fallback_last_session, exec_mode=exec_mode, moc_cutoff_min=moc_cutoff_min,
+                start_date=pd.to_datetime(START_DATE), end_date=pd.to_datetime(END_DATE),
+                lookback=LOOKBACK, horizon=HORIZON, threshold=THRESH, model_params=MODEL_PARAMS,
+                entry_prob=ENTRY_PROB, exit_prob=EXIT_PROB, commission=COMMISSION, slippage_bps=SLIPPAGE_BPS,
+                init_cap=INIT_CAP, pos_frac=POS_FRAC, sizing_mode=sizing_mode,
+                atr_lookback=atr_lookback, atr_k=atr_k, risk_per_trade_pct=risk_per_trade_pct
             )
-            df = df_full.loc[str(START_DATE):str(END_DATE)].copy()
-            last_timestamp_info(df, meta)
+            metrics = dict(metrics)
+            metrics["Ticker"] = tk
+            metrics["Name"] = get_ticker_name(tk)
+            rows.append(metrics)
+            per_ticker_cache[tk] = dict(metrics=metrics, trades=trades, df_bt=df_bt, feat=feat, meta=meta)
+        except Exception as e:
+            st.warning(f"{tk}: {e}")
 
-            # Trainieren + Backtest
-            feat, df_bt, trades, metrics = train_and_signal_no_leak(
-                df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS, atr_lookback
-            )
-            metrics["Ticker"] = ticker
-            results.append(metrics)
-            all_trades[ticker] = trades
-            all_dfs[ticker] = df_bt
-            all_feat[ticker] = feat
+    if rows:
+        ranking_df = pd.DataFrame(rows).set_index("Ticker").sort_values("Sharpe-Ratio", ascending=False)
+        st.dataframe(ranking_df)
+        topk = ranking_df.head(TOP_K).index.tolist()
+        st.success(f"Top-{len(topk)} nach Sharpe bereit.")
+    else:
+        st.info("Noch keine Ergebnisse verfügbar. Stelle sicher, dass das Universum gültige Ticker enthält und genügend Daten vorhanden sind.")
+else:
+    st.info("Nutze oben '🚀 Universum backtesten & Top-K zeigen', um das Ranking zu berechnen.")
 
-            # Kennzahlen + Trade-Zahl
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
-            c2.metric("Buy & Hold (%)",      f"{metrics['Buy & Hold Net (%)']:.2f}")
-            c3.metric("Sharpe",               f"{metrics['Sharpe-Ratio']:.2f}")
-            c4.metric("Max Drawdown (%)",     f"{metrics['Max Drawdown (%)']:.2f}")
-            c5.metric("Trades (Round-Trips)", f"{int(metrics['Number of Trades'])}")
+# ─────────────────────────────────────────────────────────────
+# Detailanalyse für Top-K (oder leeres Ranking → nichts)
+# ─────────────────────────────────────────────────────────────
+if topk:
+    st.markdown("## 🔝 Detailanalyse: Top-K nach Sharpe")
 
-            # Charts nebeneinander
-            chart_cols = st.columns(2)
+    results = []
+    all_trades: Dict[str, List[dict]] = {}
+    all_dfs:   Dict[str, pd.DataFrame] = {}
+    all_feat:  Dict[str, pd.DataFrame] = {}
 
-            # Daily Preis mit farbigen Segmenten + Events
-            df_plot = feat.copy()
-            price_fig = go.Figure()
-            price_fig.add_trace(go.Scatter(
-                x=df_plot.index, y=df_plot["Close"], mode="lines", name="Close",
-                line=dict(color="rgba(0,0,0,0.4)", width=1),
-                hovertemplate="Datum: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>"
-            ))
-            signal_probs = df_plot["SignalProb"]
-            norm = (signal_probs - signal_probs.min()) / (signal_probs.max() - signal_probs.min() + 1e-9)
-            for i in range(len(df_plot) - 1):
-                seg_x = df_plot.index[i:i+2]
-                seg_y = df_plot["Close"].iloc[i:i+2]
-                color_seg = px.colors.sample_colorscale(px.colors.diverging.RdYlGn, float(norm.iloc[i]))[0]
-                price_fig.add_trace(go.Scatter(x=seg_x, y=seg_y, mode="lines", showlegend=False,
-                                               line=dict(color=color_seg, width=2), hoverinfo="skip"))
-            trades_df = pd.DataFrame(trades)
-            if not trades_df.empty:
-                trades_df["Date"] = pd.to_datetime(trades_df["Date"])
-                entries = trades_df[trades_df["Typ"]=="Entry"]; exits = trades_df[trades_df["Typ"]=="Exit"]
-                price_fig.add_trace(go.Scatter(
-                    x=entries["Date"], y=entries["Price"], mode="markers", name="Entry",
-                    marker_symbol="triangle-up", marker=dict(size=12, color="green"),
-                    hovertemplate="Entry<br>Datum:%{x|%Y-%m-%d}<br>Preis:%{y:.2f}<extra></extra>"
-                ))
-                price_fig.add_trace(go.Scatter(
-                    x=exits["Date"], y=exits["Price"], mode="markers", name="Exit",
-                    marker_symbol="triangle-down", marker=dict(size=12, color="red"),
-                    hovertemplate="Exit<br>Datum:%{x|%Y-%m-%d}<br>Preis:%{y:.2f}<extra></extra>"
-                ))
-            price_fig.update_layout(
-                title=f"{ticker}: Preis mit Signal-Wahrscheinlichkeit (Daily)",
-                xaxis_title="Datum", yaxis_title="Preis",
-                height=420, margin=dict(t=50, b=30, l=40, r=20),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            with chart_cols[0]:
-                st.plotly_chart(price_fig, use_container_width=True)
-
-            # Intraday-Chart (letzte 5 Handelstage)
-            intra = get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval=intraday_interval)
-            with chart_cols[1]:
-                if intra.empty:
-                    st.info("Keine Intraday-Daten verfügbar (Ticker/Intervall/Zeitraum).")
+    for ticker in topk:
+        with st.expander(f"🔍 Analyse für {ticker}", expanded=False):
+            st.subheader(f"{ticker} – {get_ticker_name(ticker)}")
+            try:
+                if ticker in per_ticker_cache:
+                    m = per_ticker_cache[ticker]
+                    metrics, trades, df_bt, feat, meta = m["metrics"], m["trades"], m["df_bt"], m["feat"], m["meta"]
                 else:
-                    intr_fig = go.Figure()
+                    metrics, trades, df_bt, feat, meta = run_backtest_for_ticker(
+                        ticker=ticker, years=2, use_tail=use_live, intraday_interval=intraday_interval,
+                        fallback_last_session=fallback_last_session, exec_mode=exec_mode, moc_cutoff_min=moc_cutoff_min,
+                        start_date=pd.to_datetime(START_DATE), end_date=pd.to_datetime(END_DATE),
+                        lookback=LOOKBACK, horizon=HORIZON, threshold=THRESH, model_params=MODEL_PARAMS,
+                        entry_prob=ENTRY_PROB, exit_prob=EXIT_PROB, commission=COMMISSION, slippage_bps=SLIPPAGE_BPS,
+                        init_cap=INIT_CAP, pos_frac=POS_FRAC, sizing_mode=sizing_mode,
+                        atr_lookback=atr_lookback, atr_k=atr_k, risk_per_trade_pct=risk_per_trade_pct
+                    )
 
-                    if intraday_chart_type == "Candlestick (OHLC)":
+                results.append(dict(metrics))
+                all_trades[ticker] = trades
+                all_dfs[ticker] = df_bt
+                all_feat[ticker] = feat
+
+                last_timestamp_info(feat, meta)
+
+                # Kennzahlen
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Strategie Netto (%)", f"{metrics['Strategy Net (%)']:.2f}")
+                c2.metric("Buy & Hold (%)",      f"{metrics['Buy & Hold Net (%)']:.2f}")
+                c3.metric("Sharpe",               f"{metrics['Sharpe-Ratio']:.2f}")
+                c4.metric("Max Drawdown (%)",     f"{metrics['Max Drawdown (%)']:.2f}")
+                c5.metric("Trades (Round-Trips)", f"{int(metrics['Number of Trades'])}")
+
+                charts = st.columns(2)
+
+                # Daily Preis + Signalfarbe
+                df_plot = feat.copy()
+                price_fig = go.Figure()
+                price_fig.add_trace(go.Scatter(
+                    x=df_plot.index, y=df_plot["Close"], mode="lines", name="Close",
+                    line=dict(color="rgba(0,0,0,0.35)", width=1),
+                    hovertemplate="Datum: %{x|%Y-%m-%d}<br>Close: %{y:.2f}<extra></extra>"
+                ))
+                signal_probs = df_plot["SignalProb"]
+                norm = (signal_probs - signal_probs.min()) / (signal_probs.max() - signal_probs.min() + 1e-9)
+                for i in range(len(df_plot) - 1):
+                    seg_x = df_plot.index[i:i+2]
+                    seg_y = df_plot["Close"].iloc[i:i+2]
+                    color_seg = px.colors.sample_colorscale(px.colors.diverging.RdYlGn, float(norm.iloc[i]))[0]
+                    price_fig.add_trace(go.Scatter(x=seg_x, y=seg_y, mode="lines", showlegend=False,
+                                                   line=dict(color=color_seg, width=2), hoverinfo="skip"))
+                trades_df = pd.DataFrame(trades)
+                if not trades_df.empty:
+                    trades_df["Date"] = pd.to_datetime(trades_df["Date"])
+                    entries = trades_df[trades_df["Typ"] == "Entry"]
+                    exits   = trades_df[trades_df["Typ"] == "Exit"]
+                    price_fig.add_trace(go.Scatter(
+                        x=entries["Date"], y=entries["Price"], mode="markers", name="Entry",
+                        marker_symbol="triangle-up", marker=dict(size=12, color="green"),
+                        hovertemplate="Entry<br>%{x|%Y-%m-%d}<br>%{y:.2f}<extra></extra>"
+                    ))
+                    price_fig.add_trace(go.Scatter(
+                        x=exits["Date"], y=exits["Price"], mode="markers", name="Exit",
+                        marker_symbol="triangle-down", marker=dict(size=12, color="red"),
+                        hovertemplate="Exit<br>%{x|%Y-%m-%d}<br>%{y:.2f}<extra></extra>"
+                    ))
+                price_fig.update_layout(
+                    title=f"{ticker}: Preis mit Signal-Wahrscheinlichkeit (Daily)",
+                    xaxis_title="Datum", yaxis_title="Preis",
+                    height=420, margin=dict(t=40, b=30, l=40, r=20),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                with charts[0]:
+                    st.plotly_chart(price_fig, use_container_width=True)
+
+                # Intraday letzte 5 Handelstage
+                intra = get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval=intraday_interval)
+                with charts[1]:
+                    if intra.empty:
+                        st.info("Keine Intraday-Daten verfügbar.")
+                    else:
+                        intr_fig = go.Figure()
                         intr_fig.add_trace(
                             go.Candlestick(
                                 x=intra.index,
@@ -779,286 +751,125 @@ for ticker in TICKERS:
                                 increasing_line_width=1, decreasing_line_width=1
                             )
                         )
-                    else:
-                        intr_fig.add_trace(
-                            go.Scatter(
-                                x=intra.index, y=intra["Close"],
-                                mode="lines", name="Close (intraday)",
-                                hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Close: %{y:.2f}<extra></extra>"
-                            )
-                        )
-
-                    # Events der letzten 5 Handelstage (am Session-Start „snappen“)
-                    if not trades_df.empty:
-                        tdf = trades_df.copy()
-                        tdf["Date"] = pd.to_datetime(tdf["Date"])
-                        last_days = set(pd.Index(intra.index.normalize().unique()))
-                        ev_recent = tdf[tdf["Date"].dt.normalize().isin(last_days)].copy()
-
-                        for typ, color, symbol in [("Entry","green","triangle-up"), ("Exit","red","triangle-down")]:
-                            xs, ys = [], []
-                            for d, day_slice in intra.groupby(intra.index.normalize()):
-                                hit = ev_recent[(ev_recent["Typ"] == typ) & (ev_recent["Date"].dt.normalize() == d)]
-                                if hit.empty:
-                                    continue
-                                ts0 = day_slice.index.min()  # Session-Start
-                                if intraday_chart_type == "Candlestick (OHLC)":
-                                    y_val = float(hit["Price"].iloc[-1])
-                                else:
-                                    y_val = float(day_slice["Close"].iloc[0])
-                                xs.append(ts0); ys.append(y_val)
-                            if xs:
-                                intr_fig.add_trace(
-                                    go.Scatter(
-                                        x=xs, y=ys, mode="markers", name=typ,
-                                        marker_symbol=symbol, marker=dict(size=11, color=color),
-                                        hovertemplate=f"{typ}<br>%{{x|%Y-%m-%d %H:%M}}<br>Preis: %{{y:.2f}}<extra></extra>"
+                        if not trades_df.empty:
+                            tdf = trades_df.copy()
+                            tdf["Date"] = pd.to_datetime(tdf["Date"])
+                            last_days = set(pd.Index(intra.index.normalize().unique()))
+                            ev_recent = tdf[tdf["Date"].dt.normalize().isin(last_days)].copy()
+                            for typ, color, symbol in [("Entry","green","triangle-up"), ("Exit","red","triangle-down")]:
+                                xs, ys = [], []
+                                for d, day_slice in intra.groupby(intra.index.normalize()):
+                                    hit = ev_recent[(ev_recent["Typ"] == typ) & (ev_recent["Date"].dt.normalize() == d)]
+                                    if hit.empty:
+                                        continue
+                                    ts0 = day_slice.index.min()
+                                    y_val = float(hit["Price"].iloc[-1])  # Exec-Preis
+                                    xs.append(ts0); ys.append(y_val)
+                                if xs:
+                                    intr_fig.add_trace(
+                                        go.Scatter(
+                                            x=xs, y=ys, mode="markers", name=typ,
+                                            marker_symbol=symbol, marker=dict(size=11, color=color),
+                                            hovertemplate=f"{typ}<br>%{{x|%Y-%m-%d %H:%M}}<br>%{{y:.2f}}<extra></extra>"
+                                        )
                                     )
-                                )
+                        intr_fig.update_layout(
+                            title=f"{ticker}: Intraday – letzte 5 Handelstage ({intraday_interval})",
+                            xaxis_title="Zeit", yaxis_title="Preis",
+                            height=420, margin=dict(t=40, b=30, l=40, r=20),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        for _, day_slice in intra.groupby(intra.index.normalize()):
+                            intr_fig.add_vline(x=day_slice.index.min(), line_width=1, line_dash="dot", opacity=0.3)
+                        st.plotly_chart(intr_fig, use_container_width=True)
 
-                    intr_fig.update_layout(
-                        title=f"{ticker}: Intraday – letzte 5 Handelstage ({intraday_interval})",
-                        xaxis_title="Zeit", yaxis_title="Preis",
-                        height=420, margin=dict(t=50, b=30, l=40, r=20),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                    )
-                    for _, day_slice in intra.groupby(intra.index.normalize()):
-                        intr_fig.add_vline(x=day_slice.index.min(), line_width=1, line_dash="dot", opacity=0.3)
+                # Equity-Kurve
+                eq = go.Figure()
+                eq.add_trace(go.Scatter(x=df_bt.index, y=df_bt["Equity_Net"], name="Strategy Net Equity (Next Open)",
+                                        mode="lines", hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"))
+                bh_curve = INIT_CAP * df_bt["Close"] / df_bt["Close"].iloc[0]
+                eq.add_trace(go.Scatter(x=df_bt.index, y=bh_curve, name="Buy & Hold", mode="lines",
+                                        line=dict(dash="dash", color="black")))
+                eq.update_layout(title=f"{ticker}: Net Equity-Kurve vs. Buy & Hold", xaxis_title="Datum", yaxis_title="Equity (€)",
+                                 height=380, margin=dict(t=40, b=30, l=40, r=20),
+                                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                st.plotly_chart(eq, use_container_width=True)
 
-                    st.plotly_chart(intr_fig, use_container_width=True)
+                # Trades-Tabelle
+                with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
+                    if not trades_df.empty:
+                        df_tr = trades_df.copy()
+                        df_tr["Ticker"] = ticker
+                        df_tr["Name"] = get_ticker_name(ticker)
+                        df_tr["Date"] = pd.to_datetime(df_tr["Date"])
+                        df_tr["DateStr"] = df_tr["Date"].dt.strftime("%Y-%m-%d")
+                        df_tr["CumPnL"] = df_tr.where(df_tr["Typ"]=="Exit")["Net P&L"].cumsum().fillna(method="ffill").fillna(0)
+                        df_tr = df_tr.rename(columns={"Net P&L":"PnL","Prob":"Signal Prob","HoldDays":"Hold (days)"})
+                        # Holding Days ohne Komma → int
+                        if "Hold (days)" in df_tr.columns:
+                            df_tr["Hold (days)"] = pd.to_numeric(df_tr["Hold (days)"], errors="coerce").astype("Int64")
+                        disp_cols = ["Ticker","Name","DateStr","Typ","Price","Shares","Signal Prob","Hold (days)","PnL","CumPnL","Fees"]
+                        styled = df_tr[disp_cols].rename(columns={"DateStr":"Date"}).style.format({
+                            "Price":"{:.2f}","Shares":"{:.4f}","Signal Prob":"{:.4f}","PnL":"{:.2f}","CumPnL":"{:.2f}","Fees":"{:.2f}"
+                        })
+                        show_styled_or_plain(df_tr[disp_cols].rename(columns={"DateStr":"Date"}), styled)
+                        st.download_button(
+                            label=f"Trades {ticker} als CSV",
+                            data=df_tr[["Ticker","Name","Date","Typ","Price","Shares","Signal Prob","Hold (days)","PnL","CumPnL","Fees"]]
+                                .to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8"),
+                            file_name=f"trades_{ticker}.csv", mime="text/csv"
+                        )
+                    else:
+                        st.info("Keine Trades vorhanden.")
+            except Exception as e:
+                st.error(f"Fehler bei {ticker}: {e}")
 
-            # Equity-Kurve (unter den Charts)
-            eq = go.Figure()
-            eq.add_trace(go.Scatter(x=df_bt.index, y=df_bt["Equity_Net"], name="Strategy Net Equity (Next Open)",
-                        mode="lines", hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"))
-            bh_curve = INIT_CAP * df_bt["Close"] / df_bt["Close"].iloc[0]
-            eq.add_trace(go.Scatter(x=df_bt.index, y=bh_curve, name="Buy & Hold", mode="lines",
-                                    line=dict(dash="dash", color="black")))
-            eq.update_layout(title=f"{ticker}: Net Equity-Kurve vs. Buy & Hold", xaxis_title="Datum", yaxis_title="Equity (€)",
-                             height=400, margin=dict(t=50, b=30, l=40, r=20),
-                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-            st.plotly_chart(eq, use_container_width=True)
+    # Summary über Top-K
+    if results:
+        summary_df = pd.DataFrame(results).set_index("Ticker")
+        summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
 
-            # Trades-Tabelle je Ticker
-            with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
-                if not trades_df.empty:
-                    df_tr = trades_df.copy()
-                    df_tr["Ticker"] = ticker
-                    df_tr["Name"] = get_ticker_name(ticker)
-                    df_tr["Date"] = pd.to_datetime(df_tr["Date"])
-                    df_tr["DateStr"] = df_tr["Date"].dt.strftime("%Y-%m-%d")
-                    df_tr["CumPnL"] = df_tr.where(df_tr["Typ"]=="Exit")["Net P&L"].cumsum().fillna(method="ffill").fillna(0)
-                    df_tr = df_tr.rename(columns={"Net P&L":"PnL","Prob":"Signal Prob","HoldDays":"Hold (days)"})
-                    disp_cols = ["Ticker","Name","DateStr","Typ","Price","Shares","Signal Prob","Hold (days)","PnL","CumPnL","Fees"]
-                    styled = df_tr[disp_cols].rename(columns={"DateStr":"Date"}).style.format({
-                        "Price":"{:.2f}","Shares":"{:.4f}","Signal Prob":"{:.4f}",
-                        "Hold (days)":"{:.0f}", "PnL":"{:.2f}","CumPnL":"{:.2f}","Fees":"{:.2f}"
-                    }, na_rep="")
-                    show_styled_or_plain(df_tr[disp_cols].rename(columns={"DateStr":"Date"}), styled)
-                    st.download_button(
-                        label=f"Trades {ticker} als CSV",
-                        data=df_tr[["Ticker","Name","Date","Typ","Price","Shares","Signal Prob","Hold (days)","PnL","CumPnL","Fees"]]
-                            .to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8"),
-                        file_name=f"trades_{ticker}.csv", mime="text/csv"
-                    )
-                else:
-                    st.info("Keine Trades vorhanden.")
+        total_net_pnl  = float(summary_df["Net P&L (€)"].sum())
+        total_fees     = float(summary_df["Fees (€)"].sum())
+        total_gross_pnl = total_net_pnl + total_fees
+        total_trades   = int(summary_df["Number of Trades"].sum())
+        total_capital  = INIT_CAP * len(summary_df)
+        total_net_return_pct   = total_net_pnl / total_capital * 100 if total_capital else 0.0
+        total_gross_return_pct = total_gross_pnl / total_capital * 100 if total_capital else 0.0
+        bh_total_pct = float(summary_df["Buy & Hold Net (%)"].dropna().mean()) if "Buy & Hold Net (%)" in summary_df.columns else float("nan")
 
-        except Exception as e:
-            st.error(f"Fehler bei {ticker}: {e}")
+        st.subheader("📊 Summary Top-K (Next Open Backtest)")
+        cols = st.columns(5)
+        cols[0].metric("Cumulative Net P&L (€)",  f"{total_net_pnl:,.2f}")
+        cols[1].metric("Cumulative Trading Costs (€)", f"{total_fees:,.2f}")
+        cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
+        cols[3].metric("Total Number of Trades",   f"{total_trades}")
+        cols[4].metric("Ø Buy & Hold Net (%)", f"{bh_total_pct:.2f}")
 
-# ─────────────────────────────────────────────────────────────
-# Summary / Open Positions / Events-Filter / Round-Trips
-# ─────────────────────────────────────────────────────────────
-if 'results' in locals() and results:
-    summary_df = pd.DataFrame(results).set_index("Ticker")
-    summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
+        cols_pct = st.columns(2)
+        cols_pct[0].metric("Strategy Net (%) – total",   f"{total_net_return_pct:.2f}")
+        cols_pct[1].metric("Strategy Gross (%) – total", f"{total_gross_return_pct:.2f}")
 
-    total_net_pnl  = summary_df["Net P&L (€)"].sum()
-    total_fees     = summary_df["Fees (€)"].sum()
-    total_gross_pnl = total_net_pnl + total_fees
-    total_trades   = summary_df["Number of Trades"].sum()
-    total_capital  = INIT_CAP * len(summary_df)
-    total_net_return_pct   = total_net_pnl / total_capital * 100
-    total_gross_return_pct = total_gross_pnl / total_capital * 100
+        def color_phase_html(val):
+            colors = {"Open": "#d0ebff", "Flat": "#f0f0f0"}
+            return f"background-color: {colors.get(val, '#ffffff')};"
 
-    st.subheader("📊 Summary of all Tickers (Next Open Backtest)")
-    cols = st.columns(4)
-    cols[0].metric("Cumulative Net P&L (€)",  f"{total_net_pnl:,.2f}")
-    cols[1].metric("Cumulative Trading Costs (€)", f"{total_fees:,.2f}")
-    cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
-    cols[3].metric("Total Number of Trades",   f"{int(total_trades)}")
-
-    # Gesamtperformance (%)
-    total_strategy_net_pct   = total_net_return_pct
-    total_strategy_gross_pct = total_gross_return_pct
-    bh_total_pct = float(summary_df["Buy & Hold Net (%)"].dropna().mean()) if "Buy & Hold Net (%)" in summary_df.columns else float("nan")
-
-    cols_pct = st.columns(3)
-    cols_pct[0].metric("Strategy Net (%) – total",   f"{total_strategy_net_pct:.2f}")
-    cols_pct[1].metric("Strategy Gross (%) – total", f"{total_strategy_gross_pct:.2f}")
-    cols_pct[2].metric("Buy & Hold Net (%) – total", f"{bh_total_pct:.2f}")
-
-    def color_phase_html(val):
-        colors = {"Open": "#d0ebff", "Flat": "#f0f0f0"}
-        bg = colors.get(val, "#ffffff")
-        return f"background-color: {bg};"
-
-    styled = (
-        summary_df.style
-        .format({
-            "Strategy Net (%)":"{:.2f}",
-            "Strategy Gross (%)":"{:.2f}",
-            "Buy & Hold Net (%)":"{:.2f}",
-            "Volatility (%)":"{:.2f}",
-            "Sharpe-Ratio":"{:.2f}",
-            "Max Drawdown (%)":"{:.2f}",
-            "Calmar-Ratio":"{:.2f}",
-            "Fees (€)":"{:.2f}",
-            "Net P&L (%)":"{:.2f}",
-            "Net P&L (€)":"{:.2f}"
-        })
-        .applymap(lambda v: "font-weight: bold;" if isinstance(v,(int,float)) else "", subset=pd.IndexSlice[:,["Sharpe-Ratio"]])
-        .applymap(color_phase_html, subset=["Phase"])
-        .set_caption("Strategy-Performance per Ticker (Next Open Execution)")
-    )
-    show_styled_or_plain(summary_df, styled)
-    st.download_button(
-        "Summary als CSV herunterladen",
-        summary_df.reset_index().to_csv(index=False).encode("utf-8"),
-        file_name="strategy_summary.csv", mime="text/csv"
-    )
-
-    # Open Positions
-    st.subheader("📋 Open Positions (Next Open Backtest)")
-    open_positions = []
-    for ticker, trades in all_trades.items():
-        if trades and trades[-1]["Typ"]=="Entry":
-            last_entry = next(t for t in reversed(trades) if t["Typ"]=="Entry")
-            prob = all_feat[ticker]["SignalProb"].iloc[-1]
-            entry_ts = pd.to_datetime(last_entry["Date"])
-            open_positions.append({
-                "Ticker": ticker, "Name": get_ticker_name(ticker),
-                "Entry Date": entry_ts, "Entry Price": round(last_entry["Price"],2),
-                "Current Prob.": round(float(prob),4),
+        styled = (
+            summary_df.style
+            .format({
+                "Strategy Net (%)":"{:.2f}","Strategy Gross (%)":"{:.2f}",
+                "Buy & Hold Net (%)":"{:.2f}","Volatility (%)":"{:.2f}",
+                "Sharpe-Ratio":"{:.2f}","Max Drawdown (%)":"{:.2f}",
+                "Calmar-Ratio":"{:.2f}","Fees (€)":"{:.2f}",
+                "Net P&L (%)":"{:.2f}","Net P&L (€)":"{:.2f}"
             })
-    if open_positions:
-        open_df = pd.DataFrame(open_positions).sort_values("Entry Date", ascending=False)
-        open_df_display = open_df.copy(); open_df_display["Entry Date"] = open_df_display["Entry Date"].dt.strftime("%Y-%m-%d")
-        styled_open = open_df_display.style.format({"Entry Price":"{:.2f}","Current Prob.":"{:.4f}"})
-        show_styled_or_plain(open_df_display, styled_open)
-        st.download_button("Offene Positionen als CSV", open_df.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8"),
-                           file_name="open_positions.csv", mime="text/csv")
-    else:
-        st.success("Keine offenen Positionen.")
-
-    # Events-Filter
-    combined = []
-    for tk, tr in all_trades.items():
-        tk_name = get_ticker_name(tk)
-        for row in tr:
-            r = dict(row)
-            r["Ticker"] = tk
-            r["Name"] = tk_name
-            r["Date"] = pd.to_datetime(r["Date"])
-            combined.append(r)
-    if combined:
-        st.subheader("📒 Alle Trades (Events) – Filter")
-
-        comb_df = pd.DataFrame(combined)
-        if "Prob" not in comb_df.columns: comb_df["Prob"] = np.nan
-        if "HoldDays" not in comb_df.columns: comb_df["HoldDays"] = np.nan
-
-        min_d, max_d = comb_df["Date"].min().date(), comb_df["Date"].max().date()
-        tickers_avail = sorted(comb_df["Ticker"].unique().tolist())
-
-        f1, f2, f3 = st.columns([1.2, 1.2, 1.6])
-        with f1:
-            type_sel = st.multiselect("Typ", options=["Entry","Exit"], default=["Entry","Exit"])
-            tick_sel = st.multiselect("Ticker", options=tickers_avail, default=tickers_avail)
-        with f2:
-            date_range = st.date_input("Zeitraum", value=(min_d, max_d), min_value=min_d, max_value=max_d)
-            prob_min = float(np.nanmin(comb_df["Prob"].values)); prob_max = float(np.nanmax(comb_df["Prob"].values))
-            if not np.isfinite(prob_min): prob_min = 0.0
-            if not np.isfinite(prob_max): prob_max = 1.0
-            prob_sel = st.slider("Signal-Wahrscheinlichkeit", min_value=0.0, max_value=1.0,
-                                 value=(max(0.0,prob_min), min(1.0,prob_max)), step=0.01)
-        with f3:
-            hd_series = comb_df.loc[comb_df["Typ"]=="Exit","HoldDays"].dropna()
-            if len(hd_series): hd_min, hd_max = int(hd_series.min()), int(hd_series.max())
-            else: hd_min, hd_max = 0, 60
-            hold_sel = st.slider("Haltedauer (nur Exit-Events)", min_value=int(hd_min), max_value=int(hd_max),
-                                 value=(int(hd_min), int(hd_max)), step=1)
-
-        d_start, d_end = (date_range if isinstance(date_range, tuple) else (min_d, max_d))
-
-        mask = (
-            comb_df["Typ"].isin(type_sel) &
-            comb_df["Ticker"].isin(tick_sel) &
-            (comb_df["Date"].dt.date.between(d_start, d_end)) &
-            (comb_df["Prob"].fillna(0.0).between(prob_sel[0], prob_sel[1]))
+            .applymap(lambda v: "font-weight: bold;" if isinstance(v,(int,float)) else "", subset=pd.IndexSlice[:,["Sharpe-Ratio"]])
+            .applymap(color_phase_html, subset=["Phase"])
+            .set_caption("Strategy-Performance per Ticker (Top-K, Next Open Execution)")
         )
-        mask &= np.where(
-            comb_df["Typ"].eq("Exit"),
-            comb_df["HoldDays"].fillna(-1).between(hold_sel[0], hold_sel[1]),
-            True
-        )
-
-        comb_f = comb_df.loc[mask].copy()
-        comb_f_disp = comb_f.copy()
-        comb_f_disp["Date"] = comb_f_disp["Date"].dt.strftime("%Y-%m-%d")
-
-        wanted = ["Ticker","Name","Date","Typ","Price","Shares","Prob","HoldDays","Net P&L","kum P&L","Fees"]
-        cols_present = [c for c in wanted if c in comb_f_disp.columns]
-        styled_comb = comb_f_disp[cols_present].rename(columns={"Prob":"Signal Prob","HoldDays":"Hold (days)"}).style.format({
-            "Price":"{:.2f}","Shares":"{:.4f}","Signal Prob":"{:.4f}",
-            "Hold (days)":"{:.0f}", "Net P&L":"{:.2f}","kum P&L":"{:.2f}","Fees":"{:.2f}"
-        }, na_rep="")
-        show_styled_or_plain(comb_f_disp[cols_present].rename(columns={"Prob":"Signal Prob","HoldDays":"Hold (days)"}), styled_comb)
+        show_styled_or_plain(summary_df, styled)
         st.download_button(
-            "Gefilterte Events als CSV",
-            comb_f_disp[cols_present].to_csv(index=False).encode("utf-8"),
-            file_name="trades_events_filtered.csv", mime="text/csv"
+            "Summary Top-K als CSV",
+            summary_df.reset_index().to_csv(index=False).encode("utf-8"),
+            file_name="summary_topk.csv", mime="text/csv"
         )
-
-        # Round-Trips
-        rt_df = compute_round_trips(all_trades)
-        if not rt_df.empty:
-            st.subheader("🔁 Abgeschlossene Trades (Round-Trips) – Filter")
-            r_min_d, r_max_d = rt_df["Entry Date"].min().date(), rt_df["Exit Date"].max().date()
-            r_ticks = sorted(rt_df["Ticker"].unique().tolist())
-            r1, r2, r3 = st.columns([1.2, 1.2, 1.6])
-            with r1:
-                rt_tick_sel = st.multiselect("Ticker (Round-Trips)", options=r_ticks, default=r_ticks)
-            with r2:
-                rt_date = st.date_input("Zeitraum (Entry-Datum)", value=(r_min_d, r_max_d), min_value=r_min_d, max_value=r_max_d, key="rt_date")
-            with r3:
-                hd_min, hd_max = int(rt_df["Hold (days)"].min()), int(rt_df["Hold (days)"].max())
-                rt_hold = st.slider("Haltedauer", min_value=int(hd_min), max_value=int(hd_max),
-                                    value=(int(hd_min), int(hd_max)), step=1, key="rt_hold")
-
-            rds, rde = (rt_date if isinstance(rt_date, tuple) else (r_min_d, r_max_d))
-            rt_mask = (
-                rt_df["Ticker"].isin(rt_tick_sel) &
-                (rt_df["Entry Date"].dt.date.between(rds, rde)) &
-                (rt_df["Hold (days)"].between(rt_hold[0], rt_hold[1]))
-            )
-            rt_f = rt_df.loc[rt_mask].copy()
-            rt_disp = rt_f.copy()
-            rt_disp["Entry Date"] = rt_disp["Entry Date"].dt.strftime("%Y-%m-%d")
-            rt_disp["Exit Date"]  = rt_disp["Exit Date"].dt.strftime("%Y-%m-%d")
-
-            styled_rt = rt_disp.style.format({
-                "Entry Price":"{:.2f}","Exit Price":"{:.2f}",
-                "PnL Net (€)":"{:.2f}","Fees (€)":"{:.2f}","Return (%)":"{:.2f}",
-                "Entry Prob":"{:.4f}","Exit Prob":"{:.4f}",
-                "Hold (days)":"{:.0f}"
-            }, na_rep="")
-            show_styled_or_plain(rt_disp, styled_rt)
-            st.download_button(
-                "Round-Trips als CSV",
-                rt_disp.to_csv(index=False).encode("utf-8"),
-                file_name="round_trips.csv", mime="text/csv"
-            )
-else:
-    st.warning("Noch keine Ergebnisse verfügbar. Stelle sicher, dass das Universum gültige Ticker enthält und genügend Daten vorhanden sind.")
