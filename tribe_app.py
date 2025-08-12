@@ -217,7 +217,7 @@ elif ticker_source == "Vordefiniert (aus ./lists)":
 
 # Falls leer gelassen wurde: Fallback auf kleines Beispiel
 if not tickers_final:
-    tickers_final = _normalize_tickers(["BABA","VOW3.DE","INTC","ALV.DE","AAPL"])
+    tickers_final = _normalize_tickers(["BABA", "RQ0.F", "VOW3.DE", "INTC", "BIDU", "0700.HK", "LUMN", "2318.HK"])
 
 # Endgültige Tickerliste
 TICKERS = tickers_final
