@@ -20,6 +20,9 @@ from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import plotly.express as px
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+
 # ─────────────────────────────────────────────────────────────
 # Config / Globals
 # ─────────────────────────────────────────────────────────────
@@ -29,10 +32,33 @@ LOCAL_TZ = ZoneInfo("Europe/Zurich")
 # ─────────────────────────────────────────────────────────────
 # Sidebar / Parameter
 # ─────────────────────────────────────────────────────────────
-st.sidebar.header("Parameter")
-tickers_input = st.sidebar.text_input("Tickers (Comma-separated)", value="BABA,QBTS,VOW3.DE,INTC")
-TICKERS = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+st.sidebar.header("Universum")
+universe_source = st.sidebar.selectbox(
+    "Quelle",
+    ["Manuell (Textfeld)", "S&P 500", "NASDAQ-100", "DAX 40", "ATX", "CSV Upload (Yahoo/ Eigen)"],
+    index=0
+)
 
+tickers_input = st.sidebar.text_input(
+    "Tickers (Comma-separated)",
+    value="BABA,QBTS,VOW3.DE,INTC",
+    key="tickers_text"
+)
+
+uploaded_csv = None
+if universe_source == "CSV Upload (Yahoo/ Eigen)":
+    uploaded_csv = st.sidebar.file_uploader("CSV mit Symbolen (Spalte: Symbol oder Ticker)", type=["csv"])
+
+max_universe = st.sidebar.number_input("Max. Anzahl Ticker im Universum (Performance)", 10, 1000, 200, 10)
+top_k = st.sidebar.number_input("Top-K nach Sharpe zeigen", 5, 50, 10, 1)
+
+# Parallelisierung fürs Ranking
+use_parallel = st.sidebar.checkbox("Parallel Ranking", value=True)
+max_workers = st.sidebar.slider("Max Worker (Threads)", 1, 32, 8, help="5–10 ist meist ideal (Rate Limits beachten)")
+
+run_batch_btn = st.sidebar.button("🚀 Universum backtesten & Top-K zeigen")
+
+st.sidebar.header("Parameter")
 START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2024-01-01"))
 END_DATE   = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.now(LOCAL_TZ).date()))
 
@@ -63,12 +89,8 @@ fallback_last_session = st.sidebar.checkbox("Fallback: letzte Session verwenden 
 exec_mode = st.sidebar.selectbox("Execution Mode", ["Next Open (backtest+live)", "Market-On-Close (live only)"])
 moc_cutoff_min = st.sidebar.number_input("MOC Cutoff (Minuten vor Close, nur live)", min_value=5, max_value=60, value=15, step=5)
 
-# Neuer Umschalter: Intraday-Chart-Typ
-intraday_chart_type = st.sidebar.selectbox(
-    "Intraday-Chart",
-    ["Candlestick (OHLC)", "Close-Linie"],
-    index=0
-)
+# Intraday-Chart-Typ
+intraday_chart_type = st.sidebar.selectbox("Intraday-Chart", ["Candlestick (OHLC)", "Close-Linie"], index=0)
 
 st.sidebar.markdown("**Modellparameter**")
 n_estimators  = st.sidebar.number_input("n_estimators",  min_value=10, max_value=500, value=100, step=10)
@@ -128,6 +150,110 @@ def add_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(n).mean()
     return atr
+
+# ─────────────────────────────────────────────────────────────
+# Universen laden (Wikipedia) + CSV & Validierung
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=6*60*60)
+def fetch_sp500_symbols() -> List[str]:
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url)
+        df = tables[0]
+        syms = df["Symbol"].astype(str).str.upper()
+        syms = syms.str.replace(r"\.", "-", regex=True)
+        return syms.tolist()
+    except Exception as e:
+        st.warning(f"S&P 500 Liste konnte nicht geladen werden ({e}).")
+        return []
+
+@st.cache_data(show_spinner=False, ttl=6*60*60)
+def fetch_nasdaq100_symbols() -> List[str]:
+    try:
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        tables = pd.read_html(url)
+        df = next(t for t in tables if "Ticker" in t.columns or "Symbol" in t.columns)
+        col = "Ticker" if "Ticker" in df.columns else "Symbol"
+        syms = df[col].astype(str).str.upper().str.replace(r"\.", "-", regex=True)
+        return syms.tolist()
+    except Exception as e:
+        st.warning(f"NASDAQ-100 Liste konnte nicht geladen werden ({e}).")
+        return []
+
+@st.cache_data(show_spinner=False, ttl=6*60*60)
+def fetch_dax40_symbols() -> List[str]:
+    try:
+        url = "https://en.wikipedia.org/wiki/DAX"
+        tables = pd.read_html(url)
+        df = next(t for t in tables if ("Ticker symbol" in t.columns) or ("Ticker" in t.columns) or ("Symbol" in t.columns))
+        for c in ["Ticker symbol", "Ticker", "Symbol"]:
+            if c in df.columns:
+                base = df[c].astype(str).str.upper().str.replace(r"\.", "-", regex=True).str.replace(r"\s+", "", regex=True)
+                return (base + ".DE").tolist()
+        return []
+    except Exception as e:
+        st.warning(f"DAX 40 Liste konnte nicht geladen werden ({e}).")
+        return []
+
+@st.cache_data(show_spinner=False, ttl=6*60*60)
+def fetch_atx_symbols() -> List[str]:
+    try:
+        url = "https://en.wikipedia.org/wiki/ATX_(Austrian_Traded_Index)"
+        tables = pd.read_html(url)
+        df = next(t for t in tables if ("Ticker" in t.columns) or ("Symbol" in t.columns))
+        col = "Ticker" if "Ticker" in df.columns else "Symbol"
+        base = df[col].astype(str).str.upper().str.replace(r"\.", "-", regex=True).str.replace(r"\s+", "", regex=True)
+        return (base + ".VI").tolist()
+    except Exception as e:
+        st.warning(f"ATX Liste konnte nicht geladen werden ({e}).")
+        return []
+
+def parse_uploaded_csv(file) -> List[str]:
+    try:
+        df = pd.read_csv(file)
+    except Exception:
+        df = pd.read_csv(file, sep=";")
+    cols = [c.lower() for c in df.columns]
+    sym_col = None
+    for cand in ["symbol", "ticker", "sym", "ric"]:
+        if cand in cols:
+            sym_col = df.columns[cols.index(cand)]
+            break
+    if sym_col is None:
+        st.warning("Keine Spalte 'Symbol' oder 'Ticker' gefunden. Verwende erste Spalte als Fallback.")
+        sym_col = df.columns[0]
+    syms = df[sym_col].astype(str).str.strip().str.upper().str.replace(r"\.", "-", regex=True)
+    return syms.tolist()
+
+def get_universe(universe_source: str, tickers_text: str, uploaded_csv, cap: int) -> List[str]:
+    if universe_source == "S&P 500":
+        syms = fetch_sp500_symbols()
+    elif universe_source == "NASDAQ-100":
+        syms = fetch_nasdaq100_symbols()
+    elif universe_source == "DAX 40":
+        syms = fetch_dax40_symbols()
+    elif universe_source == "ATX":
+        syms = fetch_atx_symbols()
+    elif universe_source == "CSV Upload (Yahoo/ Eigen)" and uploaded_csv is not None:
+        syms = parse_uploaded_csv(uploaded_csv)
+    else:
+        syms = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
+    syms = list(dict.fromkeys(syms))  # de-dup
+    return syms[:cap]
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def validate_yahoo_symbols(symbols: List[str], interval: str = "1d") -> Tuple[List[str], List[str]]:
+    valid, invalid = [], []
+    for s in symbols:
+        try:
+            df = yf.Ticker(s).history(period="5d", interval=interval, auto_adjust=True, actions=False, prepost=False)
+            if isinstance(df, pd.DataFrame) and not df.empty and pd.notna(df["Close"]).any():
+                valid.append(s)
+            else:
+                invalid.append(s)
+        except Exception:
+            invalid.append(s)
+    return valid, invalid
 
 # ─────────────────────────────────────────────────────────────
 # Daten: 1D-Historie + NUR-HEUTE Intraday-Tail
@@ -448,10 +574,115 @@ def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ─────────────────────────────────────────────────────────────
+# Batch-Run + Ranking nach Sharpe (parallel optional)
+# ─────────────────────────────────────────────────────────────
+def _eval_one_ticker(
+    t, start_date, end_date, lookback, horizon, threshold, model_params,
+    use_live, intraday_interval, fallback_last_session, exec_mode, moc_cutoff_min,
+    atr_lookback
+):
+    try:
+        df_full, _ = get_price_data_tail_intraday(
+            t, years=2, use_tail=use_live, interval=intraday_interval,
+            fallback_last_session=fallback_last_session,
+            exec_mode_key=exec_mode, moc_cutoff_min_val=moc_cutoff_min
+        )
+        df = df_full.loc[str(start_date):str(end_date)].copy()
+        _, df_bt, trades, metrics = train_and_signal_no_leak(
+            df, lookback, horizon, threshold, model_params, atr_lookback
+        )
+        metrics["Ticker"] = t
+        metrics["Name"]   = get_ticker_name(t)
+        return metrics
+    except Exception as e:
+        return {"Ticker": t, "Name": get_ticker_name(t), "Sharpe-Ratio": -np.inf, "Error": str(e)}
+
+@st.cache_data(show_spinner=True, ttl=60)
+def batch_rank_tickers(
+    tickers: List[str],
+    start_date, end_date,
+    lookback, horizon, threshold, model_params,
+    use_live, intraday_interval, fallback_last_session, exec_mode, moc_cutoff_min,
+    atr_lookback,
+    parallel: bool = True, workers: int = 8
+) -> pd.DataFrame:
+    rows = []
+    runner = partial(
+        _eval_one_ticker,
+        start_date=start_date, end_date=end_date,
+        lookback=lookback, horizon=horizon, threshold=threshold, model_params=model_params,
+        use_live=use_live, intraday_interval=intraday_interval,
+        fallback_last_session=fallback_last_session, exec_mode=exec_mode, moc_cutoff_min=moc_cutoff_min,
+        atr_lookback=atr_lookback
+    )
+
+    if parallel:
+        workers = max(1, int(workers))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(runner, t): t for t in tickers}
+            for fut in as_completed(futures):
+                rows.append(fut.result())
+    else:
+        for t in tickers:
+            rows.append(runner(t))
+
+    rank = pd.DataFrame(rows)
+    if "Sharpe-Ratio" in rank.columns:
+        rank = rank.sort_values("Sharpe-Ratio", ascending=False, na_position="last")
+    return rank.reset_index(drop=True)
+
+# ─────────────────────────────────────────────────────────────
 # Haupt
 # ─────────────────────────────────────────────────────────────
 st.markdown("<h1 style='font-size: 36px;'>📈 AI Signal-based Trading-Strategy</h1>", unsafe_allow_html=True)
 
+# Universum bestimmen + validieren
+TICKERS = get_universe(universe_source, st.session_state["tickers_text"], uploaded_csv, max_universe)
+valid_syms, invalid_syms = validate_yahoo_symbols(TICKERS)
+if invalid_syms:
+    st.sidebar.warning(
+        f"{len(invalid_syms)} Symbole ohne Daten (übersprungen): "
+        + ", ".join(invalid_syms[:10]) + (" …" if len(invalid_syms) > 10 else "")
+    )
+TICKERS = valid_syms
+st.caption(f"Aktives Universum: {len(TICKERS)} Ticker")
+
+# Universums-Ranking
+st.markdown("### 🔎 Universum-Ranking (Sharpe)")
+if run_batch_btn and TICKERS:
+    with st.spinner("Backtest läuft über das Universum ..."):
+        rank_df = batch_rank_tickers(
+            TICKERS, START_DATE, END_DATE,
+            LOOKBACK, HORIZON, THRESH, MODEL_PARAMS,
+            use_live, intraday_interval, fallback_last_session, exec_mode, moc_cutoff_min,
+            atr_lookback,
+            parallel=use_parallel, workers=max_workers
+        )
+    if not rank_df.empty:
+        top_df = rank_df.head(int(top_k)).copy()
+        styled = top_df.style.format({
+            "Sharpe-Ratio": "{:.2f}",
+            "Strategy Net (%)": "{:.2f}",
+            "Strategy Gross (%)": "{:.2f}",
+            "Buy & Hold Net (%)": "{:.2f}",
+            "Volatility (%)": "{:.2f}",
+            "Max Drawdown (%)": "{:.2f}",
+            "Fees (€)": "{:.2f}",
+            "Net P&L (€)": "{:.2f}",
+        })
+        st.subheader(f"🏆 Top {int(top_k)} nach Sharpe")
+        show_styled_or_plain(top_df, styled)
+        st.download_button(
+            "Ranking als CSV herunterladen",
+            rank_df.to_csv(index=False).encode("utf-8"),
+            file_name="universe_ranking.csv",
+            mime="text/csv"
+        )
+        st.info("🔁 Du kannst die Top-K Ticker kopieren und oben ins Textfeld einfügen, um Detail-Charts/Trades zu sehen.")
+else:
+    st.caption("Nutze links '🚀 Universum backtesten & Top-K zeigen', um den Lauf zu starten.")
+
+# Detail-Analyse je Ticker
 results = []
 all_trades: Dict[str, List[dict]] = {}
 all_dfs:   Dict[str, pd.DataFrame] = {}
@@ -491,7 +722,7 @@ for ticker in TICKERS:
             # Charts nebeneinander
             chart_cols = st.columns(2)
 
-            # --- Daily Preis mit farbigen Segmenten + Events ---
+            # Daily Preis mit farbigen Segmenten + Events
             df_plot = feat.copy()
             price_fig = go.Figure()
             price_fig.add_trace(go.Scatter(
@@ -530,7 +761,7 @@ for ticker in TICKERS:
             with chart_cols[0]:
                 st.plotly_chart(price_fig, use_container_width=True)
 
-            # --- Intraday-Chart (letzte 5 Handelstage) mit Umschalter ---
+            # Intraday-Chart (letzte 5 Handelstage)
             intra = get_intraday_last_n_sessions(ticker, sessions=5, days_buffer=10, interval=intraday_interval)
             with chart_cols[1]:
                 if intra.empty:
@@ -557,7 +788,7 @@ for ticker in TICKERS:
                             )
                         )
 
-                    # Events der letzten 5 Handelstage
+                    # Events der letzten 5 Handelstage (am Session-Start „snappen“)
                     if not trades_df.empty:
                         tdf = trades_df.copy()
                         tdf["Date"] = pd.to_datetime(tdf["Date"])
@@ -572,9 +803,9 @@ for ticker in TICKERS:
                                     continue
                                 ts0 = day_slice.index.min()  # Session-Start
                                 if intraday_chart_type == "Candlestick (OHLC)":
-                                    y_val = float(hit["Price"].iloc[-1])           # Exec-Preis (Open inkl. Slippage)
+                                    y_val = float(hit["Price"].iloc[-1])
                                 else:
-                                    y_val = float(day_slice["Close"].iloc[0])      # auf Linie snappen
+                                    y_val = float(day_slice["Close"].iloc[0])
                                 xs.append(ts0); ys.append(y_val)
                             if xs:
                                 intr_fig.add_trace(
@@ -620,8 +851,9 @@ for ticker in TICKERS:
                     df_tr = df_tr.rename(columns={"Net P&L":"PnL","Prob":"Signal Prob","HoldDays":"Hold (days)"})
                     disp_cols = ["Ticker","Name","DateStr","Typ","Price","Shares","Signal Prob","Hold (days)","PnL","CumPnL","Fees"]
                     styled = df_tr[disp_cols].rename(columns={"DateStr":"Date"}).style.format({
-                        "Price":"{:.2f}","Shares":"{:.4f}","Signal Prob":"{:.4f}","PnL":"{:.2f}","CumPnL":"{:.2f}","Fees":"{:.2f}"
-                    })
+                        "Price":"{:.2f}","Shares":"{:.4f}","Signal Prob":"{:.4f}",
+                        "Hold (days)":"{:.0f}", "PnL":"{:.2f}","CumPnL":"{:.2f}","Fees":"{:.2f}"
+                    }, na_rep="")
                     show_styled_or_plain(df_tr[disp_cols].rename(columns={"DateStr":"Date"}), styled)
                     st.download_button(
                         label=f"Trades {ticker} als CSV",
@@ -638,7 +870,7 @@ for ticker in TICKERS:
 # ─────────────────────────────────────────────────────────────
 # Summary / Open Positions / Events-Filter / Round-Trips
 # ─────────────────────────────────────────────────────────────
-if results:
+if 'results' in locals() and results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
     summary_df["Net P&L (%)"] = (summary_df["Net P&L (€)"] / INIT_CAP) * 100
 
@@ -675,11 +907,16 @@ if results:
     styled = (
         summary_df.style
         .format({
-            "Strategy Net (%)":"{:.2f}","Strategy Gross (%)":"{:.2f}",
-            "Buy & Hold Net (%)":"{:.2f}","Volatility (%)":"{:.2f}",
-            "Sharpe-Ratio":"{:.2f}","Max Drawdown (%)":"{:.2f}",
-            "Calmar-Ratio":"{:.2f}","Fees (€)":"{:.2f}",
-            "Net P&L (%)":"{:.2f}","Net P&L (€)":"{:.2f}"
+            "Strategy Net (%)":"{:.2f}",
+            "Strategy Gross (%)":"{:.2f}",
+            "Buy & Hold Net (%)":"{:.2f}",
+            "Volatility (%)":"{:.2f}",
+            "Sharpe-Ratio":"{:.2f}",
+            "Max Drawdown (%)":"{:.2f}",
+            "Calmar-Ratio":"{:.2f}",
+            "Fees (€)":"{:.2f}",
+            "Net P&L (%)":"{:.2f}",
+            "Net P&L (€)":"{:.2f}"
         })
         .applymap(lambda v: "font-weight: bold;" if isinstance(v,(int,float)) else "", subset=pd.IndexSlice[:,["Sharpe-Ratio"]])
         .applymap(color_phase_html, subset=["Phase"])
@@ -774,8 +1011,9 @@ if results:
         wanted = ["Ticker","Name","Date","Typ","Price","Shares","Prob","HoldDays","Net P&L","kum P&L","Fees"]
         cols_present = [c for c in wanted if c in comb_f_disp.columns]
         styled_comb = comb_f_disp[cols_present].rename(columns={"Prob":"Signal Prob","HoldDays":"Hold (days)"}).style.format({
-            "Price":"{:.2f}","Shares":"{:.4f}","Signal Prob":"{:.4f}","Net P&L":"{:.2f}","kum P&L":"{:.2f}","Fees":"{:.2f}"
-        })
+            "Price":"{:.2f}","Shares":"{:.4f}","Signal Prob":"{:.4f}",
+            "Hold (days)":"{:.0f}", "Net P&L":"{:.2f}","kum P&L":"{:.2f}","Fees":"{:.2f}"
+        }, na_rep="")
         show_styled_or_plain(comb_f_disp[cols_present].rename(columns={"Prob":"Signal Prob","HoldDays":"Hold (days)"}), styled_comb)
         st.download_button(
             "Gefilterte Events als CSV",
@@ -813,8 +1051,9 @@ if results:
             styled_rt = rt_disp.style.format({
                 "Entry Price":"{:.2f}","Exit Price":"{:.2f}",
                 "PnL Net (€)":"{:.2f}","Fees (€)":"{:.2f}","Return (%)":"{:.2f}",
-                "Entry Prob":"{:.4f}","Exit Prob":"{:.4f}"
-            })
+                "Entry Prob":"{:.4f}","Exit Prob":"{:.4f}",
+                "Hold (days)":"{:.0f}"
+            }, na_rep="")
             show_styled_or_plain(rt_disp, styled_rt)
             st.download_button(
                 "Round-Trips als CSV",
@@ -822,4 +1061,4 @@ if results:
                 file_name="round_trips.csv", mime="text/csv"
             )
 else:
-    st.warning("Noch keine Ergebnisse verfügbar. Stelle sicher, dass mindestens ein Ticker korrekt eingegeben ist und genügend Daten vorhanden sind.")
+    st.warning("Noch keine Ergebnisse verfügbar. Stelle sicher, dass das Universum gültige Ticker enthält und genügend Daten vorhanden sind.")
