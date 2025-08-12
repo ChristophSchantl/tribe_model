@@ -176,7 +176,7 @@ TICKERS = tickers_final
 # ─────────────────────────────────────────────────────────────
 # Weitere Parameter
 # ─────────────────────────────────────────────────────────────
-START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2024-01-01"))
+START_DATE = st.sidebar.date_input("Start Date", value=pd.to_datetime("2025-01-01"))
 END_DATE   = st.sidebar.date_input("End Date", value=pd.to_datetime(datetime.now(LOCAL_TZ).date()))
 
 LOOKBACK = st.sidebar.number_input("Lookback (Tage)", min_value=10, max_value=252, value=60, step=5)
