@@ -731,7 +731,7 @@ if results:
     # ─────────────────────────────────────────────────────────
     # Events-Filter (optional ausblendbar)
     # ─────────────────────────────────────────────────────────
-    SHOW_EVENTS_FILTER = False  # ← auf True setzen, um den Events-Filter wieder zu zeigen
+    SHOW_EVENTS_FILTER = True  # ← auf True setzen, um den Events-Filter wieder zu zeigen
 
     if SHOW_EVENTS_FILTER:
         combined = []
