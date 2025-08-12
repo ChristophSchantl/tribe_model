@@ -990,71 +990,71 @@ if results:
                 st.plotly_chart(fig_pnl, use_container_width=True)
 
         # ─────────────────────────────────────────────────────────
-        # Portfolio-Korrelation (Heatmap) – nach den Histogrammen
+        # 🔗 Portfolio-Korrelation (Close-Returns)
         # ─────────────────────────────────────────────────────────
         st.markdown("### 🔗 Portfolio-Korrelation (Close-Returns)")
+        c1, c2, c3, c4 = st.columns([1.2, 1.0, 1.2, 1.0])
+        with c1:
+            corr_freq = st.selectbox("Return-Frequenz", ["täglich", "wöchentlich", "monatlich"], index=0, key="corr_freq")
+        with c2:
+            corr_method = st.selectbox("Korrelationsmethode", ["Pearson", "Spearman", "Kendall"], index=0, key="corr_method")
+        with c3:
+            min_obs = st.slider("Min. gemeinsame Zeitpunkte", 3, 60, 20, step=1, key="corr_min_obs")
+        with c4:
+            use_ffill = st.checkbox("Lücken per FFill schließen", value=True, key="corr_ffill")
         
-        if len(all_dfs) >= 2:
-            # Preise der ausgewählten Ticker zu einer Matrix zusammenbauen
-            price_cols = {}
-            for tk, df_bt in all_dfs.items():
-                if "Close" in df_bt.columns:
-                    s = df_bt["Close"].rename(tk).astype(float)
-                    s = s.loc[str(START_DATE):str(END_DATE)]
-                    price_cols[tk] = s
+        # Preise einsammeln (aus all_dfs)
+        price_series = []
+        col_labels = []
+        for tk, dfbt in all_dfs.items():
+            if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
+                s = dfbt["Close"].copy()
+                s.name = tk
+                price_series.append(s)
+                col_labels.append(tk)
         
-            if price_cols:
-                prices = pd.concat(price_cols.values(), axis=1, join="inner")
-                prices = prices.dropna(how="any")
-        
-                c1, c2 = st.columns(2)
-                with c1:
-                    freq_label = st.selectbox("Return-Frequenz",
-                                              options=["täglich", "wöchentlich", "monatlich"],
-                                              index=0, key="corr_freq")
-                with c2:
-                    method_label = st.selectbox("Korrelationsmethode",
-                                                options=["Pearson", "Spearman"],
-                                                index=0, key="corr_method")
-        
-                freq_map = {"täglich": "D", "wöchentlich": "W-FRI", "monatlich": "M"}
-                prices_rs = prices.resample(freq_map[freq_label]).last()
-        
-                rets = prices_rs.pct_change().dropna(how="any")
-                if rets.shape[0] >= 5 and rets.shape[1] >= 2:
-                    corr = rets.corr(method=method_label.lower())
-        
-                    # Reihenfolge wie in TICKERS halten (nur vorhandene Spalten)
-                    ordered_cols = [tk for tk in TICKERS if tk in corr.columns]
-                    corr = corr.loc[ordered_cols, ordered_cols]
-        
-                    fig_corr = px.imshow(
-                        corr.round(2),
-                        text_auto=True,                    # Zahlen in den Kästchen
-                        color_continuous_scale="RdBu_r",
-                        zmin=-1, zmax=1,
-                        aspect="auto",
-                        labels=dict(color="ρ")
-                    )
-                    fig_corr.update_layout(
-                        title="Korrelation der Close-Returns",
-                        height=520,
-                        margin=dict(t=50, b=30, l=40, r=20)
-                    )
-                    st.plotly_chart(fig_corr, use_container_width=True)
-        
-                    st.download_button(
-                        "Korrelationsmatrix als CSV",
-                        corr.to_csv().encode("utf-8"),
-                        file_name="correlation_matrix.csv",
-                        mime="text/csv"
-                    )
-                else:
-                    st.info("Zu wenige Datenüberschneidungen für eine Korrelationsmatrix.")
-            else:
-                st.info("Keine Preisdaten gefunden.")
+        if len(price_series) < 2:
+            st.info("Mindestens zwei Ticker mit Daten nötig.")
         else:
-            st.info("Mindestens zwei Ticker nötig, um Korrelationen zu berechnen.")
+            prices = pd.concat(price_series, axis=1, join="outer").sort_index()
+            if use_ffill:
+                prices = prices.ffill()
+        
+            # Resampling
+            if corr_freq == "wöchentlich":
+                prices = prices.resample("W-FRI").last()
+            elif corr_freq == "monatlich":
+                prices = prices.resample("M").last()
+        
+            # Returns
+            rets = prices.pct_change().dropna(how="all")
+        
+            # Spalten mit zu wenig Beobachtungen entfernen
+            enough = [c for c in rets.columns if rets[c].count() >= min_obs]
+            rets = rets[enough]
+        
+            # Prüfen, ob die Schnittmenge groß genug ist
+            common_rows = rets.dropna(how="any")
+            if rets.shape[1] < 2 or len(common_rows) < min_obs:
+                st.info("Zu wenige Datenüberschneidungen für eine Korrelationsmatrix.")
+            else:
+                corr = rets.corr(method=corr_method.lower(), min_periods=min_obs)
+        
+                # Heatmap mit Werten in den Kästchen
+                fig_corr = px.imshow(
+                    corr,
+                    text_auto=".2f",
+                    aspect="auto",
+                    color_continuous_scale="RdBu",
+                    zmin=-1, zmax=1
+                )
+                fig_corr.update_layout(
+                    height=560,
+                    margin=dict(t=40, l=40, r=30, b=40),
+                    coloraxis_colorbar=dict(title="ρ")
+                )
+                st.plotly_chart(fig_corr, use_container_width=True)
+                st.caption(f"Basis: {len(common_rows)} gemeinsame Zeitpunkte · Frequenz: {corr_freq} · Methode: {corr_method}")
 
 
     
