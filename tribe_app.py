@@ -86,19 +86,17 @@ def get_embedded_lists() -> Dict[str, List[str]]:
     Du kannst die Listen unten jederzeit erweitern.
     """
     return {
-        "DE/DAX40 (Auszug)": _normalize_tickers([
-            "ALV.DE","BAS.DE","BAYN.DE","BEI.DE","BMW.DE","CBK.DE","CON.DE","DHL.DE",
-            "DPW.DE","DTG.DE","HEI.DE","HEN3.DE","IFX.DE","LIN.DE","MRK.DE","MUV2.DE",
-            "PAH3.DE","P911.DE","RWE.DE","SAP.DE","SIE.DE","VNA.DE","VOW3.DE"
+        "ALPHA Portfolio": _normalize_tickers([
+            "BABA", "RQ0.F", "VOW3.DE", "INTC", "BIDU", "0700.HK", "LUMN", "2318.HK"
         ]),
-        "US/Nasdaq100 (Auszug)": _normalize_tickers([
-            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","TSLA","COST",
-            "ADBE","NFLX","AMD","INTC","QCOM","PDD"
+        "INCOME Portfolio": _normalize_tickers([
+            "SSREY","IMB.L","HOT.F","EOAN.DE","04Q.F","BACHY","EBS","TLX.DE","FTE.F",
+            "TEF","BMT.F","FO4N.F","KGX.DE","RIO","MDT","CNE.SG","KSS","DWS.DE","MRK.DE","PC60.F","CPP.F"
         ]),
         "US/S&P500 (Auszug)": _normalize_tickers([
             "AAPL","MSFT","AMZN","META","GOOGL","BRK-B","NVDA","JPM","XOM","UNH","V","HD","PG","MA"
         ]),
-        "AT/ATX (Auszug)": _normalize_tickers([
+        "Austria": _normalize_tickers([
             "EBS.VI","OMV.VI","VER.VI","VOE.VI","RBI.VI","ANDR.VI","DO&CO.VI","SBO.VI"
         ]),
         "HK/HangSeng (Auszug)": _normalize_tickers([
