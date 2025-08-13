@@ -38,7 +38,6 @@ def _normalize_tickers(items: List[str]) -> List[str]:
         s = x.strip().upper()
         if s:
             cleaned.append(s)
-    # Deduplizieren bei Erhalt der Reihenfolge
     return list(dict.fromkeys(cleaned))
 
 def parse_ticker_csv(path_or_buffer) -> List[str]:
@@ -49,7 +48,6 @@ def parse_ticker_csv(path_or_buffer) -> List[str]:
     try:
         df = pd.read_csv(path_or_buffer)
     except Exception:
-        # Fallback: evtl. Semikolon
         df = pd.read_csv(path_or_buffer, sep=";")
     if df.empty:
         return []
@@ -58,15 +56,11 @@ def parse_ticker_csv(path_or_buffer) -> List[str]:
         if key in cols_lower:
             col = cols_lower[key]
             return _normalize_tickers(df[col].astype(str).tolist())
-    # sonst erste Spalte nehmen
     first = df.columns[0]
     return _normalize_tickers(df[first].astype(str).tolist())
 
 def get_embedded_lists() -> Dict[str, List[str]]:
-    """
-    Eingebettete (im Code hinterlegte) Vorlagen – optional.
-    Du kannst die Listen unten jederzeit erweitern.
-    """
+    """Im Code hinterlegte Beispiel-Listen – gerne erweitern."""
     return {
         "ALPHA Portfolio": _normalize_tickers([
             "BABA", "RQ0.F", "VOW3.DE", "INTC", "BIDU", "0700.HK", "LUMN", "2318.HK"
@@ -85,7 +79,6 @@ def get_embedded_lists() -> Dict[str, List[str]]:
 # ─────────────────────────────────────────────────────────────
 st.sidebar.header("Parameter")
 
-# Quelle für Ticker wählen (ohne Ordner-Suche)
 ticker_source = st.sidebar.selectbox(
     "Ticker-Quelle",
     ["Manuell (Textfeld)", "CSV-Upload", "Vordefiniert (eingebettet)"],
@@ -115,7 +108,6 @@ elif ticker_source == "CSV-Upload":
 
     if tickers_final:
         st.sidebar.caption(f"Gefundene Ticker: {len(tickers_final)}")
-        # Option zum Mischen & Begrenzen
         shuffle_lists = st.sidebar.checkbox("Zufällig mischen", value=False, help="Reihenfolge zufällig (seed=42)")
         if shuffle_lists:
             import random
@@ -124,11 +116,10 @@ elif ticker_source == "CSV-Upload":
                                         value=0, step=10)
         if max_n and max_n < len(tickers_final):
             tickers_final = tickers_final[:int(max_n)]
-        # Feintuning
         tickers_final = st.sidebar.multiselect("Auswahl verfeinern", options=tickers_final, default=tickers_final)
 
 elif ticker_source == "Vordefiniert (eingebettet)":
-    embedded = get_embedded_lists()  # im Code hinterlegt
+    embedded = get_embedded_lists()
     combined = []
     if embedded:
         emb_choices = st.sidebar.multiselect(
@@ -166,11 +157,10 @@ elif ticker_source == "Vordefiniert (eingebettet)":
     else:
         st.sidebar.info("Noch keine Ticker ausgewählt/gefunden.")
 
-# Falls leer gelassen wurde: Fallback auf kleines Beispiel
+# Fallback
 if not tickers_final:
     tickers_final = _normalize_tickers(["BABA", "RQ0.F", "VOW3.DE", "INTC", "BIDU", "0700.HK", "LUMN", "2318.HK"])
 
-# Endgültige Tickerliste
 TICKERS = tickers_final
 
 # ─────────────────────────────────────────────────────────────
@@ -206,12 +196,8 @@ fallback_last_session = st.sidebar.checkbox("Fallback: letzte Session verwenden 
 exec_mode = st.sidebar.selectbox("Execution Mode", ["Next Open (backtest+live)", "Market-On-Close (live only)"])
 moc_cutoff_min = st.sidebar.number_input("MOC Cutoff (Minuten vor Close, nur live)", min_value=5, max_value=60, value=15, step=5)
 
-# Neuer Umschalter: Intraday-Chart-Typ
-intraday_chart_type = st.sidebar.selectbox(
-    "Intraday-Chart",
-    ["Candlestick (OHLC)", "Close-Linie"],
-    index=0
-)
+# Intraday-Chart-Typ
+intraday_chart_type = st.sidebar.selectbox("Intraday-Chart", ["Candlestick (OHLC)", "Close-Linie"], index=0)
 
 st.sidebar.markdown("**Modellparameter**")
 n_estimators  = st.sidebar.number_input("n_estimators",  min_value=10, max_value=500, value=100, step=10)
@@ -245,7 +231,6 @@ def last_timestamp_info(df: pd.DataFrame, meta: Optional[dict] = None):
         msg += f" (intraday bis {meta['tail_ts'].strftime('%H:%M %Z')})"
     st.caption(msg)
 
-# Name-Lookup (gecached)
 @st.cache_data(show_spinner=False, ttl=24*60*60)
 def get_ticker_name(ticker: str) -> str:
     try:
@@ -262,7 +247,6 @@ def get_ticker_name(ticker: str) -> str:
         pass
     return ticker
 
-# ATR
 def add_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     prev_close = df["Close"].shift(1)
     tr1 = df["High"] - df["Low"]
@@ -273,7 +257,7 @@ def add_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return atr
 
 # ─────────────────────────────────────────────────────────────
-# Daten: 1D-Historie + NUR-HEUTE Intraday-Tail
+# Daten-Funktionen
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
 def get_price_data_tail_intraday(
@@ -286,15 +270,12 @@ def get_price_data_tail_intraday(
     moc_cutoff_min_val: int = 15,
 ) -> Tuple[pd.DataFrame, dict]:
     tk = yf.Ticker(ticker)
-
     df = tk.history(period=f"{years}y", interval="1d", auto_adjust=True, actions=False)
     if df.empty:
         raise ValueError(f"Keine Daten für {ticker}")
-
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert(LOCAL_TZ)
-
     meta = {"tail_is_intraday": False, "tail_ts": None}
 
     if not use_tail:
@@ -347,9 +328,6 @@ def get_price_data_tail_intraday(
     df.dropna(subset=["High", "Low", "Close"], inplace=True)
     return df, meta
 
-# ─────────────────────────────────────────────────────────────
-# Intraday-Fetch für letzten 5 Handelstage (für Neben-Chart)
-# ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=120)
 def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: int = 10, interval: str = "5m") -> pd.DataFrame:
     tk = yf.Ticker(ticker)
@@ -366,7 +344,7 @@ def get_intraday_last_n_sessions(ticker: str, sessions: int = 5, days_buffer: in
     return intr.loc[mask].copy()
 
 # ─────────────────────────────────────────────────────────────
-# Features & Training ohne Leakage
+# Features, Training & Backtest (ohne Leakage)
 # ─────────────────────────────────────────────────────────────
 def make_features(df: pd.DataFrame, lookback: int, horizon: int) -> pd.DataFrame:
     feat = df.copy()
@@ -377,14 +355,15 @@ def make_features(df: pd.DataFrame, lookback: int, horizon: int) -> pd.DataFrame
     feat["FutureRet"] = feat["Close"].shift(-horizon) / feat["Close"] - 1
     return feat
 
-@st.cache_data(show_spinner=False, ttl=120)
 def train_and_signal_no_leak(
     df: pd.DataFrame,
     lookback: int,
     horizon: int,
     threshold: float,
     model_params: dict,
-    atr_lookback: int
+    atr_lookback: int,
+    entry_prob: float,
+    exit_prob: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[dict], dict]:
     feat = make_features(df, lookback, horizon)
     feat["ATR"] = add_atr(df, n=atr_lookback).reindex(feat.index)
@@ -404,15 +383,12 @@ def train_and_signal_no_leak(
     feat_bt = feat.iloc[:-1].copy()  # letzte Zeile = live/out-of-sample
 
     df_bt, trades = backtest_next_open(
-        feat_bt, ENTRY_PROB, EXIT_PROB, COMMISSION, SLIPPAGE_BPS,
+        feat_bt, entry_prob, exit_prob, COMMISSION, SLIPPAGE_BPS,
         INIT_CAP, POS_FRAC, sizing_mode, risk_per_trade_pct, atr_k
     )
     metrics = compute_performance(df_bt, trades, INIT_CAP)
     return feat, df_bt, trades, metrics
 
-# ─────────────────────────────────────────────────────────────
-# Backtester: t-Signal → t+1 Open (incl. Prob & HoldDays)
-# ─────────────────────────────────────────────────────────────
 def backtest_next_open(
     df: pd.DataFrame,
     entry_thr: float,
@@ -555,7 +531,6 @@ def compute_performance(df_bt: pd.DataFrame, trades: List[dict], init_cap: float
         "Net P&L (€)": round(net_eur, 2),
     }
 
-# Round-Trips (Entry→Exit) inkl. Haltedauer
 def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
     rows = []
     for tk, tr in all_trades.items():
@@ -591,6 +566,120 @@ def compute_round_trips(all_trades: Dict[str, List[dict]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ─────────────────────────────────────────────────────────────
+# 🧭 Parameter-Optimierung (Random Search mit Frequenz-Penalty)
+# ─────────────────────────────────────────────────────────────
+st.subheader("🧭 Parameter-Optimierung")
+
+with st.expander("Optimizer (Random Search mit Walk-Forward-Light)", expanded=False):
+    n_trials = st.number_input("Trials", 10, 1000, 80, step=10)
+    seed = st.number_input("Seed", 0, 10_000, 42)
+    lambda_trades = st.number_input("Penalty λ pro Trade", 0.0, 1.0, 0.02, step=0.005,
+                                    help="Je höher, desto stärker wird die Handelsfrequenz bestraft.")
+    min_trades_req = st.number_input("Min. Trades gesamt (Filter)", 0, 10000, 5, step=1)
+
+    # Suchräume
+    lb_lo, lb_hi = st.slider("Lookback", 10, 252, (30, 120), step=5)
+    hz_lo, hz_hi = st.slider("Horizon", 1, 10, (1, 5))
+    thr_lo, thr_hi = st.slider("Threshold Target", 0.0, 0.10, (0.01, 0.05), step=0.005, format="%.3f")
+    en_lo, en_hi = st.slider("Entry Prob Range", 0.0, 1.0, (0.55, 0.85), step=0.01)
+    ex_lo, ex_hi = st.slider("Exit Prob Range", 0.0, 1.0, (0.30, 0.60), step=0.01)
+
+    @st.cache_data(show_spinner=False)
+    def _get_prices_for_optimizer(
+        tickers: tuple, start: str, end: str, use_tail: bool, interval: str,
+        fallback_last: bool, exec_key: str, moc_cutoff: int
+    ):
+        data = {}
+        for tk in tickers:
+            try:
+                df_full, _ = get_price_data_tail_intraday(
+                    tk, years=2, use_tail=use_tail,
+                    interval=interval, fallback_last_session=fallback_last,
+                    exec_mode_key=exec_key, moc_cutoff_min_val=moc_cutoff
+                )
+                data[tk] = df_full.loc[str(start):str(end)].copy()
+            except Exception:
+                pass
+        return data
+
+    def _sample_params(rng):
+        return dict(
+            lookback = rng.randrange(lb_lo, lb_hi+1, 5),
+            horizon  = rng.randrange(hz_lo, hz_hi+1, 1),
+            thresh   = rng.uniform(thr_lo, thr_hi),
+            entry    = rng.uniform(en_lo, en_hi),
+            exit     = rng.uniform(ex_lo, ex_hi),
+        )
+
+    if st.button("🔎 Suche starten", type="primary", use_container_width=True):
+        import random
+        rng = random.Random(int(seed))
+        price_map = _get_prices_for_optimizer(
+            tuple(TICKERS), str(START_DATE), str(END_DATE),
+            use_live, intraday_interval, fallback_last_session, exec_mode, int(moc_cutoff_min)
+        )
+        rows, best = [], None
+
+        for t in range(int(n_trials)):
+            p = _sample_params(rng)
+            if p["exit"] >= p["entry"]:
+                continue  # Exit muss unter Entry liegen
+
+            sharps, trades_total, feasible = [], 0, 0
+
+            # Walk-Forward-Light: halbiere das Fenster und werte beide Hälften
+            for tk, df in price_map.items():
+                if df is None or len(df) < max(60, p["lookback"]+p["horizon"]+5):
+                    continue
+                feasible += 1
+                mid = df.index[int(len(df)*0.5)]
+                for sub in [df.loc[:mid], df.loc[mid:]]:
+                    try:
+                        _, df_bt, trades, mets = train_and_signal_no_leak(
+                            sub, p["lookback"], p["horizon"], p["thresh"],
+                            MODEL_PARAMS, atr_lookback, p["entry"], p["exit"]
+                        )
+                        sharps.append(mets["Sharpe-Ratio"])
+                        trades_total += int(mets["Number of Trades"])
+                    except Exception:
+                        pass
+
+            if feasible == 0:
+                continue
+
+            sharpe_avg = float(np.nanmean(sharps)) if len(sharps) else float("nan")
+            denom = max(1, feasible * 2)  # Ticker * Halbzeiten
+            score = sharpe_avg - float(lambda_trades) * (trades_total / denom)
+
+            rec = dict(trial=t, score=score, sharpe_avg=sharpe_avg,
+                       trades=trades_total, **p)
+            rows.append(rec)
+            if (best is None) or (score > best["score"]):
+                best = rec
+
+        if not rows:
+            st.warning("Keine gültigen Kandidaten gefunden.")
+        else:
+            df_res = pd.DataFrame(rows).sort_values("score", ascending=False)
+            df_show = df_res[df_res["trades"] >= int(min_trades_req)].copy()
+            if df_show.empty:
+                df_show = df_res.copy()
+
+            st.success(f"Beste Parameter: Score={best['score']:.3f} | Sharpe={best['sharpe_avg']:.2f} | Trades={best['trades']}")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Lookback", int(best["lookback"]))
+            c2.metric("Horizon",  int(best["horizon"]))
+            c3.metric("Target Thresh", f"{best['thresh']:.3f}")
+            c4.metric("Entry Prob",    f"{best['entry']:.2f}")
+            c5.metric("Exit Prob",     f"{best['exit']:.2f}")
+
+            st.caption("Top-Ergebnisse (Score = ØSharpe − λ·Trades/(Ticker·Halbzeit))")
+            st.dataframe(df_show.head(25), use_container_width=True)
+            st.download_button("Optimierergebnisse als CSV",
+                               df_res.to_csv(index=False).encode("utf-8"),
+                               file_name="param_search_results.csv", mime="text/csv")
+
+# ─────────────────────────────────────────────────────────────
 # Haupt
 # ─────────────────────────────────────────────────────────────
 st.markdown("<h1 style='font-size: 36px;'>📈 AI Signal-based Trading-Strategy</h1>", unsafe_allow_html=True)
@@ -615,7 +704,7 @@ for ticker in TICKERS:
 
             # Trainieren + Backtest
             feat, df_bt, trades, metrics = train_and_signal_no_leak(
-                df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS, atr_lookback
+                df, LOOKBACK, HORIZON, THRESH, MODEL_PARAMS, atr_lookback, ENTRY_PROB, EXIT_PROB
             )
             metrics["Ticker"] = ticker
             results.append(metrics)
@@ -680,54 +769,39 @@ for ticker in TICKERS:
                     st.info("Keine Intraday-Daten verfügbar (Ticker/Intervall/Zeitraum).")
                 else:
                     intr_fig = go.Figure()
-
                     if intraday_chart_type == "Candlestick (OHLC)":
-                        intr_fig.add_trace(
-                            go.Candlestick(
-                                x=intra.index,
-                                open=intra["Open"], high=intra["High"],
-                                low=intra["Low"],  close=intra["Close"],
-                                name="OHLC (intraday)",
-                                increasing_line_width=1, decreasing_line_width=1
-                            )
-                        )
+                        intr_fig.add_trace(go.Candlestick(
+                            x=intra.index, open=intra["Open"], high=intra["High"],
+                            low=intra["Low"],  close=intra["Close"],
+                            name="OHLC (intraday)",
+                            increasing_line_width=1, decreasing_line_width=1
+                        ))
                     else:
-                        intr_fig.add_trace(
-                            go.Scatter(
-                                x=intra.index, y=intra["Close"],
-                                mode="lines", name="Close (intraday)",
-                                hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Close: %{y:.2f}<extra></extra>"
-                            )
-                        )
-
-                    # Events der letzten 5 Handelstage
+                        intr_fig.add_trace(go.Scatter(
+                            x=intra.index, y=intra["Close"], mode="lines", name="Close (intraday)",
+                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>Close: %{y:.2f}<extra></extra>"
+                        ))
+                    # Events (Entry/Exit) der letzten 5 Handelstage
                     if not trades_df.empty:
                         tdf = trades_df.copy()
                         tdf["Date"] = pd.to_datetime(tdf["Date"])
                         last_days = set(pd.Index(intra.index.normalize().unique()))
                         ev_recent = tdf[tdf["Date"].dt.normalize().isin(last_days)].copy()
-
                         for typ, color, symbol in [("Entry","green","triangle-up"), ("Exit","red","triangle-down")]:
                             xs, ys = [], []
                             for d, day_slice in intra.groupby(intra.index.normalize()):
                                 hit = ev_recent[(ev_recent["Typ"] == typ) & (ev_recent["Date"].dt.normalize() == d)]
                                 if hit.empty:
                                     continue
-                                ts0 = day_slice.index.min()  # Session-Start
-                                if intraday_chart_type == "Candlestick (OHLC)":
-                                    y_val = float(hit["Price"].iloc[-1])           # Exec-Preis (Open inkl. Slippage)
-                                else:
-                                    y_val = float(day_slice["Close"].iloc[0])      # auf Linie snappen
+                                ts0 = day_slice.index.min()
+                                y_val = float(hit["Price"].iloc[-1]) if intraday_chart_type == "Candlestick (OHLC)" else float(day_slice["Close"].iloc[0])
                                 xs.append(ts0); ys.append(y_val)
                             if xs:
-                                intr_fig.add_trace(
-                                    go.Scatter(
-                                        x=xs, y=ys, mode="markers", name=typ,
-                                        marker_symbol=symbol, marker=dict(size=11, color=color),
-                                        hovertemplate=f"{typ}<br>%{{x|%Y-%m-%d %H:%M}}<br>Preis: %{{y:.2f}}<extra></extra>"
-                                    )
-                                )
-
+                                intr_fig.add_trace(go.Scatter(
+                                    x=xs, y=ys, mode="markers", name=typ,
+                                    marker_symbol=symbol, marker=dict(size=11, color=color),
+                                    hovertemplate=f"{typ}<br>%{{x|%Y-%m-%d %H:%M}}<br>Preis: %{{y:.2f}}<extra></extra>"
+                                ))
                     intr_fig.update_layout(
                         title=f"{ticker}: Intraday – letzte 5 Handelstage ({intraday_interval})",
                         xaxis_title="Zeit", yaxis_title="Preis",
@@ -736,10 +810,9 @@ for ticker in TICKERS:
                     )
                     for _, day_slice in intra.groupby(intra.index.normalize()):
                         intr_fig.add_vline(x=day_slice.index.min(), line_width=1, line_dash="dot", opacity=0.3)
-
                     st.plotly_chart(intr_fig, use_container_width=True)
 
-            # Equity-Kurve (unter den Charts)
+            # Equity-Kurve
             eq = go.Figure()
             eq.add_trace(go.Scatter(x=df_bt.index, y=df_bt["Equity_Net"], name="Strategy Net Equity (Next Open)",
                         mode="lines", hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}€<extra></extra>"))
@@ -751,7 +824,7 @@ for ticker in TICKERS:
                              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
             st.plotly_chart(eq, use_container_width=True)
 
-            # Trades-Tabelle je Ticker
+            # Trades-Tabelle
             with st.expander(f"Trades (Next Open) für {ticker}", expanded=False):
                 if not trades_df.empty:
                     df_tr = trades_df.copy()
@@ -779,7 +852,7 @@ for ticker in TICKERS:
             st.error(f"Fehler bei {ticker}: {e}")
 
 # ─────────────────────────────────────────────────────────────
-# Summary / Open Positions / Events-Filter / Round-Trips
+# Summary / Open Positions / Round-Trips / Korrelation
 # ─────────────────────────────────────────────────────────────
 if results:
     summary_df = pd.DataFrame(results).set_index("Ticker")
@@ -800,7 +873,6 @@ if results:
     cols[2].metric("Cumulative Gross P&L (€)", f"{total_gross_pnl:,.2f}")
     cols[3].metric("Total Number of Trades",   f"{int(total_trades)}")
 
-    # Gesamtperformance (%)
     total_strategy_net_pct   = total_net_return_pct
     total_strategy_gross_pct = total_gross_return_pct
     bh_total_pct = float(summary_df["Buy & Hold Net (%)"].dropna().mean()) if "Buy & Hold Net (%)" in summary_df.columns else float("nan")
@@ -834,9 +906,7 @@ if results:
         file_name="strategy_summary.csv", mime="text/csv"
     )
 
-    # ─────────────────────────────────────────────────────────
     # Open Positions
-    # ─────────────────────────────────────────────────────────
     st.subheader("📋 Open Positions (Next Open Backtest)")
     open_positions = []
     for ticker, trades in all_trades.items():
@@ -863,9 +933,7 @@ if results:
     else:
         st.success("Keine offenen Positionen.")
 
-    # ─────────────────────────────────────────────────────────
-    # Round-Trips (Entry → Exit) – mit Filter + Histogramme
-    # ─────────────────────────────────────────────────────────
+    # Round-Trips + Histogramme
     rt_df = compute_round_trips(all_trades)
 
     if not rt_df.empty:
@@ -945,7 +1013,7 @@ if results:
             file_name="round_trips_filtered.csv", mime="text/csv"
         )
 
-        # 📊 Verteilung der Round-Trip-Ergebnisse (gefiltert)
+        # Histogramme
         st.markdown("### 📊 Verteilung der Round-Trip-Ergebnisse")
         bins = st.slider("Anzahl Bins", min_value=10, max_value=100, value=30, step=5, key="rt_bins")
 
@@ -1002,85 +1070,67 @@ if results:
             min_obs = st.slider("Min. gemeinsame Zeitpunkte", 3, 60, 20, step=1, key="corr_min_obs")
         with c4:
             use_ffill = st.checkbox("Lücken per FFill schließen", value=True, key="corr_ffill")
-        
-        # Preise einsammeln (aus all_dfs)
+
+        # Preise aus allen df_bt ziehen
         price_series = []
-        col_labels = []
         for tk, dfbt in all_dfs.items():
             if isinstance(dfbt, pd.DataFrame) and "Close" in dfbt.columns and len(dfbt) >= 2:
-                s = dfbt["Close"].copy()
-                s.name = tk
+                s = dfbt["Close"].copy(); s.name = tk
                 price_series.append(s)
-                col_labels.append(tk)
-        
+
+        corr = None
         if len(price_series) < 2:
             st.info("Mindestens zwei Ticker mit Daten nötig.")
         else:
             prices = pd.concat(price_series, axis=1, join="outer").sort_index()
             if use_ffill:
                 prices = prices.ffill()
-        
-            # Resampling
+
             if corr_freq == "wöchentlich":
                 prices = prices.resample("W-FRI").last()
             elif corr_freq == "monatlich":
                 prices = prices.resample("M").last()
-        
-            # Returns
+
             rets = prices.pct_change().dropna(how="all")
-        
-            # Spalten mit zu wenig Beobachtungen entfernen
             enough = [c for c in rets.columns if rets[c].count() >= min_obs]
             rets = rets[enough]
-        
-            # Prüfen, ob die Schnittmenge groß genug ist
+
             common_rows = rets.dropna(how="any")
             if rets.shape[1] < 2 or len(common_rows) < min_obs:
                 st.info("Zu wenige Datenüberschneidungen für eine Korrelationsmatrix.")
             else:
                 corr = rets.corr(method=corr_method.lower(), min_periods=min_obs)
-        
-                # Heatmap mit Werten in den Kästchen
+
                 fig_corr = px.imshow(
-                    corr,
-                    text_auto=".2f",
-                    aspect="auto",
-                    color_continuous_scale="RdBu",
-                    zmin=-1, zmax=1
+                    corr, text_auto=".2f", aspect="auto",
+                    color_continuous_scale="RdBu", zmin=-1, zmax=1
                 )
                 fig_corr.update_layout(
-                    height=560,
-                    margin=dict(t=40, l=40, r=30, b=40),
+                    height=560, margin=dict(t=40, l=40, r=30, b=40),
                     coloraxis_colorbar=dict(title="ρ")
                 )
                 st.plotly_chart(fig_corr, use_container_width=True)
                 st.caption(f"Basis: {len(common_rows)} gemeinsame Zeitpunkte · Frequenz: {corr_freq} · Methode: {corr_method}")
 
-        # ── Einzelzahl(en) zur Portfolio-Korrelation ─────────────────
-        N = corr.shape[0]
-        if N >= 2:
-            # Alle Off-Diagonal-Werte (paarweise Korrelationen)
+        # Zahlen zur Portfolio-Korrelation
+        if corr is not None and corr.shape[0] >= 2:
+            N = corr.shape[0]
             tri_vals = corr.where(~np.eye(N, dtype=bool)).stack()
             avg_pair = float(tri_vals.mean())
             med_pair = float(tri_vals.median())
             std_pair = float(tri_vals.std())
-        
-            # Gleichgewichtete Intra-Portfolio-Korrelation (roh & normiert 0..1)
+
             w = np.full(N, 1.0 / N)
             ip_corr_raw = float(w @ corr.values @ w)                  # in [1/N, 1]
             ip_corr_norm = float((ip_corr_raw - 1.0/N) / (1.0 - 1.0/N))
-        
+
             mc1, mc2, mc3, mc4 = st.columns(4)
             mc1.metric("Ø Paar-Korrelation", f"{avg_pair:.2f}")
             mc2.metric("Median", f"{med_pair:.2f}")
             mc3.metric("Streuung (σ)", f"{std_pair:.2f}")
             mc4.metric("Portfolio-Korrelation (normiert)", f"{ip_corr_norm:.2f}")
-        
-            st.caption(
-                f"IPC roh={ip_corr_raw:.3f} · normiert={ip_corr_norm:.3f} · N={N} · Methode: {corr_method}"
-            )
+            st.caption(f"IPC roh={ip_corr_raw:.3f} · normiert={ip_corr_norm:.3f} · N={N} · Methode: {corr_method}")
 
-    
     else:
         st.info("Noch keine abgeschlossenen Round-Trips vorhanden.")
 else:
